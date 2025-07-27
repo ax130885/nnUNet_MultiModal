@@ -107,11 +107,11 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
 
         # 設置臨床損失的權重，可能需要根據實驗調整
         self.clinical_loss_weights = {
-            'location': 1.0,
-            't_stage': 0.8,
-            'n_stage': 0.4,
-            'm_stage': 0.4,
-            'missing_flags': 0.05 # 權重較低
+            'location': 0.0,  # 位置分類損失權重
+            't_stage': 0.0,
+            'n_stage': 0.0,
+            'm_stage': 0.0,
+            'missing_flags': 0.00 # 權重較低
         }
         print("nnUNetTrainerMultimodal 初始化完成。")
 
@@ -136,11 +136,11 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
                 'input_channels': self.num_input_channels_img,
                 'num_classes': self.label_manager.num_segmentation_heads,
                 'deep_supervision': self.enable_deep_supervision,
-                'prompt_dim': 17,
+                'prompt_dim': 14,
                 'location_classes': 7,
-                't_stage_classes': 7,
-                'n_stage_classes': 5,
-                'm_stage_classes': 4,
+                't_stage_classes': 6,
+                'n_stage_classes': 4,
+                'm_stage_classes': 3,
                 'missing_flags_dim': 4
             }
             self.network = self.build_network_architecture(MyModel, my_model_init_kwargs).to(self.device)
@@ -186,11 +186,11 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
                 'input_channels': self.num_input_channels_img,
                 'num_classes': self.label_manager.num_segmentation_heads,
                 'deep_supervision': self.enable_deep_supervision,
-                'prompt_dim': 17,
+                'prompt_dim': 14,
                 'location_classes': 7,
-                't_stage_classes': 7,
-                'n_stage_classes': 5,
-                'm_stage_classes': 4,
+                't_stage_classes': 6,
+                'n_stage_classes': 4,
+                'm_stage_classes': 3,
                 'missing_flags_dim': 4
             }
         """
@@ -946,7 +946,7 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
                     image_data_np, _, seg_prev_np, properties = load_result
                     # 為臨床資料字典設定預設值，以確保程式碼能繼續執行
                     clinical_features_dict = {
-                        'prompt_features': np.zeros(17, dtype=np.float32), # 匹配 MyModel 的 prompt_dim
+                        'prompt_features': np.zeros(14, dtype=np.float32), # 匹配 MyModel 的 prompt_dim
                         'location_label': -1,
                         't_stage_label': -1,
                         'n_stage_label': -1,
@@ -1153,9 +1153,9 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
                     # 定義要評估的臨床屬性及其對應的真實標籤、預測標籤和總類別數
                     attrs_to_evaluate = {
                         'location': (all_true_loc_labels, all_pred_loc_labels, model_init_kwargs.get('location_classes', 7)),
-                        't_stage': (all_true_t_labels, all_pred_t_labels, model_init_kwargs.get('t_stage_classes', 7)),
-                        'n_stage': (all_true_n_labels, all_pred_n_labels, model_init_kwargs.get('n_stage_classes', 5)),
-                        'm_stage': (all_true_m_labels, all_pred_m_labels, model_init_kwargs.get('m_stage_classes', 4)),
+                        't_stage': (all_true_t_labels, all_pred_t_labels, model_init_kwargs.get('t_stage_classes', 6)),
+                        'n_stage': (all_true_n_labels, all_pred_n_labels, model_init_kwargs.get('n_stage_classes', 4)),
+                        'm_stage': (all_true_m_labels, all_pred_m_labels, model_init_kwargs.get('m_stage_classes', 3)),
                     }
 
                     for attr_type, (true_labels, pred_labels, num_classes) in attrs_to_evaluate.items():

@@ -7,19 +7,19 @@ from torch.nn.modules.activation import LeakyReLU
 
 class MyModel(nn.Module):
     def __init__(self, input_channels=1, num_classes=2, deep_supervision=True, 
-                 prompt_dim=17, location_classes=7, t_stage_classes=7, 
-                 n_stage_classes=5, m_stage_classes=4, 
+                 prompt_dim=14, location_classes=7, t_stage_classes=6, 
+                 n_stage_classes=4, m_stage_classes=3, 
                  missing_flags_dim=4):
         """
         Args:
             input_channels: 影像輸入通道數
             num_classes: 分割類別數
             deep_supervision: 是否使用深度監督
-            prompt_dim: 結構化提示的維度 (7位置類別 + 3 TNM類別 + 3不確定性標記 + 4缺失標記 = 17)
+            prompt_dim: 結構化提示的維度 (7位置類別 + 3 TNM類別 + 4缺失標記 = 14)
             location_classes: 腫瘤位置類別數 (7: ascending, transverse, descending, sigmoid, rectal, rectosigmoid, NONE)
-            t_stage_classes: T分期類別數 (7: T0, T1, T2, T3, T4, Tx, NONE)
-            n_stage_classes: N分期類別數 (5: N0, N1, N2, Nx, NONE)
-            m_stage_classes: M分期類別數 (4: M0, M1, Mx, NONE)
+            t_stage_classes: T分期類別數 (6: T0, T1, T2, T3, T4, NONE)
+            n_stage_classes: N分期類別數 (4: N0, N1, N2, NONE)
+            m_stage_classes: M分期類別數 (3: M0, M1, NONE)
             missing_flags_dim: 缺失標記維度 (4: 位置缺失, T缺失, N缺失, M缺失)
         """
         super().__init__()
@@ -316,133 +316,170 @@ class MyModel(nn.Module):
         self.deep_supervision = enabled
         self.decoder.deep_supervision = enabled
 
+# if __name__ == "__main__":
+#     import torch
+    
+#     # 設置設備
+#     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+#     print(f"使用設備: {device}")
+    
+#     # 設定輸入參數
+#     batch_size = 1
+#     input_channels = 1
+#     depth, height, width = 112, 160, 128  # 輸入的體積大小
+#     prompt_dim = 14
+    
+#     # 創建模型
+#     model = MyModel(
+#         input_channels=input_channels, 
+#         deep_supervision=True, 
+#         prompt_dim=prompt_dim
+#     ).to(device)
+    
+#     # 創建隨機輸入數據
+#     image = torch.randn(batch_size, input_channels, depth, height, width).to(device)
+#     prompt = torch.randn(batch_size, prompt_dim).to(device)
+#     print(prompt)
+#     # breakpoint()  # 在這裡設置斷點以便調試
+    
+#     # 顯示輸入形狀
+#     print(f"輸入影像形狀: {image.shape}")
+#     print(f"輸入提示形狀: {prompt.shape}")
+    
+#     # 追蹤編碼器每個階段後的大小
+#     encoder_outputs = []
+#     x_img = image
+    
+#     print("\n編碼器階段尺寸變化:")
+#     print("-" * 50)
+    
+#     for i, stage in enumerate(model.encoder_stages):
+#         x_img = stage(x_img)
+#         encoder_outputs.append(x_img)
+#         print(f"編碼器階段 {i}: {x_img.shape}")
+    
+#     # 取得瓶頸層特徵
+#     bottleneck = encoder_outputs[-1]
+#     print(f"\n瓶頸層形狀: {bottleneck.shape}")
+    
+#     # 提示編碼器前向傳播
+#     prompt_embedding = model.prompt_encoder(prompt)
+#     print(f"提示嵌入形狀: {prompt_embedding.shape}")
+    
+#     # 將提示嵌入擴展為與瓶頸層相同的空間維度
+#     prompt_expanded = prompt_embedding.view(prompt_embedding.size(0), prompt_embedding.size(1), 1, 1, 1)
+#     prompt_expanded = prompt_expanded.expand(
+#         -1, -1, 
+#         bottleneck.size(2), 
+#         bottleneck.size(3), 
+#         bottleneck.size(4)
+#     )
+#     print(f"擴展後的提示形狀: {prompt_expanded.shape}")
+    
+#     # 特徵融合
+#     fused = torch.cat([bottleneck, prompt_expanded], dim=1)
+#     print(f"拼接後的特徵形狀: {fused.shape}")
+    
+#     fused_bottleneck = model.fusion_block(fused)
+#     print(f"融合後的瓶頸層形狀: {fused_bottleneck.shape}")
+    
+#     # 解碼器每個階段後的大小
+#     print("\n解碼器階段尺寸變化:")
+#     print("-" * 50)
+    
+#     # 替換原始瓶頸層
+#     encoder_outputs[-1] = fused_bottleneck
+    
+#     # 追蹤解碼器階段
+#     lres_input = encoder_outputs[-1]
+    
+#     for i in range(len(model.decoder_stages)):
+#         # 轉置卷積
+#         x = model.transpconvs[i](lres_input)
+#         print(f"解碼器階段 {i} (轉置卷積後): {x.shape}")
+        
+#         # 與跳躍連接特徵拼接
+#         skip = encoder_outputs[-(i+2)]
+#         print(f"解碼器階段 {i} (跳躍連接特徵): {skip.shape}")
+        
+#         x = torch.cat((x, skip), dim=1)
+#         print(f"解碼器階段 {i} (拼接後): {x.shape}")
+        
+#         # 卷積塊
+#         x = model.decoder_stages[i](x)
+#         print(f"解碼器階段 {i} (卷積後): {x.shape}")
+        
+#         # 分割層
+#         seg = model.seg_layers[i](x)
+#         print(f"解碼器階段 {i} (分割輸出): {seg.shape}")
+        
+#         lres_input = x
+#         print("-" * 50)
+    
+#     # 屬性預測
+#     attribute_features = model.attribute_predictor(fused_bottleneck)
+#     print(f"屬性特徵形狀: {attribute_features.shape}")
+    
+#     attributes = {
+#         'location': model.location_head(attribute_features),
+#         't_stage': model.t_stage_head(attribute_features),
+#         'n_stage': model.n_stage_head(attribute_features),
+#         'm_stage': model.m_stage_head(attribute_features)
+#     }
+    
+#     for attr_name, attr_value in attributes.items():
+#         print(f"{attr_name}預測輸出形狀: {attr_value.shape}")
+        
+#     # 完整前向傳播測試
+#     print("\n完整模型前向傳播測試:")
+#     print("-" * 50)
+    
+#     with torch.no_grad():
+#         outputs, attr_outputs = model(image, prompt)
+        
+#         if model.deep_supervision:
+#             print(f"分割輸出數量: {len(outputs)}")
+#             for i, output in enumerate(outputs):
+#                 print(f"分割輸出 {i} 形狀: {output.shape}")
+#         else:
+#             print(f"分割輸出形狀: {outputs.shape}")
+        
+#         for attr_name, attr_value in attr_outputs.items():
+#             print(f"{attr_name}屬性輸出形狀: {attr_value.shape}")
+
+
+
+def calc_receptive_field():
+    # 每層卷積的 kernel size 與 stride 配置
+    # 按照 encoder 的順序，每層兩個 conv block
+    stages = [
+        # stage0
+        [((3,3,3), (1,1,1)), ((3,3,3), (1,1,1))],
+        # stage1
+        [((3,3,3), (2,2,2)), ((3,3,3), (1,1,1))],
+        # stage2
+        [((3,3,3), (2,2,2)), ((3,3,3), (1,1,1))],
+        # stage3
+        [((3,3,3), (2,2,2)), ((3,3,3), (1,1,1))],
+        # stage4
+        [((3,3,3), (2,2,2)), ((3,3,3), (1,1,1))],
+        # stage5
+        [((3,3,3), (1,2,2)), ((3,3,3), (1,1,1))],
+    ]
+
+    rf = [1, 1, 1]      # receptive field for d, h, w
+    jump = [1, 1, 1]    # actual stride in d, h, w for each output position
+
+    print("Stage, Conv, RF(d,h,w), Jump(d,h,w)")
+    for si, stage in enumerate(stages):
+        for ci, (kernel, stride) in enumerate(stage):
+            rf = [r + (k-1)*j for r, k, j in zip(rf, kernel, jump)]
+            jump = [j * s for j, s in zip(jump, stride)]
+            print(f"{si:>2}, {ci+1}, {rf}, {jump}")
+    print(f"\n最終感受野(Depth, Height, Width): {rf}")
+    print(f"最終 jump (實際一格對應原圖幾格): {jump}")
+
 if __name__ == "__main__":
-    import torch
-    
-    # 設置設備
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"使用設備: {device}")
-    
-    # 設定輸入參數
-    batch_size = 1
-    input_channels = 1
-    depth, height, width = 112, 160, 128  # 輸入的體積大小
-    prompt_dim = 10
-    
-    # 創建模型
-    model = MyModel(
-        input_channels=input_channels, 
-        deep_supervision=True, 
-        prompt_dim=prompt_dim
-    ).to(device)
-    
-    # 創建隨機輸入數據
-    image = torch.randn(batch_size, input_channels, depth, height, width).to(device)
-    prompt = torch.randn(batch_size, prompt_dim).to(device)
-    print(prompt)
-    # breakpoint()  # 在這裡設置斷點以便調試
-    
-    # 顯示輸入形狀
-    print(f"輸入影像形狀: {image.shape}")
-    print(f"輸入提示形狀: {prompt.shape}")
-    
-    # 追蹤編碼器每個階段後的大小
-    encoder_outputs = []
-    x_img = image
-    
-    print("\n編碼器階段尺寸變化:")
-    print("-" * 50)
-    
-    for i, stage in enumerate(model.encoder_stages):
-        x_img = stage(x_img)
-        encoder_outputs.append(x_img)
-        print(f"編碼器階段 {i}: {x_img.shape}")
-    
-    # 取得瓶頸層特徵
-    bottleneck = encoder_outputs[-1]
-    print(f"\n瓶頸層形狀: {bottleneck.shape}")
-    
-    # 提示編碼器前向傳播
-    prompt_embedding = model.prompt_encoder(prompt)
-    print(f"提示嵌入形狀: {prompt_embedding.shape}")
-    
-    # 將提示嵌入擴展為與瓶頸層相同的空間維度
-    prompt_expanded = prompt_embedding.view(prompt_embedding.size(0), prompt_embedding.size(1), 1, 1, 1)
-    prompt_expanded = prompt_expanded.expand(
-        -1, -1, 
-        bottleneck.size(2), 
-        bottleneck.size(3), 
-        bottleneck.size(4)
-    )
-    print(f"擴展後的提示形狀: {prompt_expanded.shape}")
-    
-    # 特徵融合
-    fused = torch.cat([bottleneck, prompt_expanded], dim=1)
-    print(f"拼接後的特徵形狀: {fused.shape}")
-    
-    fused_bottleneck = model.fusion_block(fused)
-    print(f"融合後的瓶頸層形狀: {fused_bottleneck.shape}")
-    
-    # 解碼器每個階段後的大小
-    print("\n解碼器階段尺寸變化:")
-    print("-" * 50)
-    
-    # 替換原始瓶頸層
-    encoder_outputs[-1] = fused_bottleneck
-    
-    # 追蹤解碼器階段
-    lres_input = encoder_outputs[-1]
-    
-    for i in range(len(model.decoder_stages)):
-        # 轉置卷積
-        x = model.transpconvs[i](lres_input)
-        print(f"解碼器階段 {i} (轉置卷積後): {x.shape}")
-        
-        # 與跳躍連接特徵拼接
-        skip = encoder_outputs[-(i+2)]
-        print(f"解碼器階段 {i} (跳躍連接特徵): {skip.shape}")
-        
-        x = torch.cat((x, skip), dim=1)
-        print(f"解碼器階段 {i} (拼接後): {x.shape}")
-        
-        # 卷積塊
-        x = model.decoder_stages[i](x)
-        print(f"解碼器階段 {i} (卷積後): {x.shape}")
-        
-        # 分割層
-        seg = model.seg_layers[i](x)
-        print(f"解碼器階段 {i} (分割輸出): {seg.shape}")
-        
-        lres_input = x
-        print("-" * 50)
-    
-    # 屬性預測
-    attribute_features = model.attribute_predictor(fused_bottleneck)
-    print(f"屬性特徵形狀: {attribute_features.shape}")
-    
-    attributes = {
-        'location': model.location_head(attribute_features),
-        't_stage': model.t_stage_head(attribute_features),
-        'n_stage': model.n_stage_head(attribute_features),
-        'm_stage': model.m_stage_head(attribute_features)
-    }
-    
-    for attr_name, attr_value in attributes.items():
-        print(f"{attr_name}預測輸出形狀: {attr_value.shape}")
-        
-    # 完整前向傳播測試
-    print("\n完整模型前向傳播測試:")
-    print("-" * 50)
-    
-    with torch.no_grad():
-        outputs, attr_outputs = model(image, prompt)
-        
-        if model.deep_supervision:
-            print(f"分割輸出數量: {len(outputs)}")
-            for i, output in enumerate(outputs):
-                print(f"分割輸出 {i} 形狀: {output.shape}")
-        else:
-            print(f"分割輸出形狀: {outputs.shape}")
-        
-        for attr_name, attr_value in attr_outputs.items():
-            print(f"{attr_name}屬性輸出形狀: {attr_value.shape}")
+    # ...原本你的測試程式...
+    print("\n===== 計算Encoder感受野 =====")
+    calc_receptive_field()

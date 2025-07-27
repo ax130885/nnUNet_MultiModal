@@ -11,7 +11,7 @@ from nnunetv2.utilities.plans_handling.plans_handler import PlansManager, Config
 from nnunetv2.utilities.label_handling.label_handling import determine_num_input_channels
 
 # 與 MyModel 內的 prompt_dim 保持一致，避免硬編碼錯誤
-DEFAULT_PROMPT_DIM = 17
+DEFAULT_PROMPT_DIM = 14
 
 
 class PreprocessAdapterBareBonesMultimodal(DataLoader):

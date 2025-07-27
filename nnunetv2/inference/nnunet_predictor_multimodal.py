@@ -468,9 +468,9 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
 
             attr_output_shapes = {
                 'location': (attr_init_kwargs.get('location_classes', 7),),
-                't_stage': (attr_init_kwargs.get('t_stage_classes', 7),),
-                'n_stage': (attr_init_kwargs.get('n_stage_classes', 5),),
-                'm_stage': (attr_init_kwargs.get('m_stage_classes', 4),),
+                't_stage': (attr_init_kwargs.get('t_stage_classes', 6),),
+                'n_stage': (attr_init_kwargs.get('n_stage_classes', 4),),
+                'm_stage': (attr_init_kwargs.get('m_stage_classes', 3),),
                 'missing_flags': (attr_init_kwargs.get('missing_flags_dim', 4),)
             }
             # 初始化臨床屬性 logits 字典，用於存儲第一次預測結果 (或平均結果)
@@ -729,8 +729,8 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
     #         # 而在 Predictor 中，network_arch_init_kwargs 可能不包含 MyModel 的所有自訂參數
     #         # 穩健做法是從 self.network (或其 module/orig_mod) 中獲取 MyModel 的 prompt_dim
     #         # 為簡潔起見，這裡硬編碼為 17 (MyModel 預設值)
-    #         prompt_dim = self.network.init_kwargs.get('prompt_dim', 17) if not isinstance(self.network, (nn.parallel.DistributedDataParallel, OptimizedModule)) \
-    #             else (self.network.module.init_kwargs.get('prompt_dim', 17) if isinstance(self.network, DistributedDataParallel) else self.network._orig_mod.init_kwargs.get('prompt_dim', 17))
+    #         prompt_dim = self.network.init_kwargs.get('prompt_dim', 14) if not isinstance(self.network, (nn.parallel.DistributedDataParallel, OptimizedModule)) \
+    #             else (self.network.module.init_kwargs.get('prompt_dim', 14) if isinstance(self.network, DistributedDataParallel) else self.network._orig_mod.init_kwargs.get('prompt_dim', 14))
     #         clinical_features_tensor = torch.zeros((1, prompt_dim), dtype=torch.float32)
 
     #     if self.verbose:
@@ -1031,11 +1031,11 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
                 )
                 # ★★ 讀取 prompt_dim 等額外參數 ★★
                 extra_kwargs = checkpoint.get('init_kwargs', {})
-                prompt_dim = extra_kwargs.get('prompt_dim', 17)
+                prompt_dim = extra_kwargs.get('prompt_dim', 14)
                 location_classes = extra_kwargs.get('location_classes', 7)
-                t_stage_classes = extra_kwargs.get('t_stage_classes', 7)
-                n_stage_classes = extra_kwargs.get('n_stage_classes', 5)
-                m_stage_classes = extra_kwargs.get('m_stage_classes', 4)
+                t_stage_classes = extra_kwargs.get('t_stage_classes', 6)
+                n_stage_classes = extra_kwargs.get('n_stage_classes', 4)
+                m_stage_classes = extra_kwargs.get('m_stage_classes', 3)
                 missing_flags_dim = extra_kwargs.get('missing_flags_dim', 4)
             parameters.append(checkpoint['network_weights'])
 
@@ -1060,9 +1060,9 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
         #     'deep_supervision': self.enable_deep_supervision,
         #     'prompt_dim': 17,
         #     'location_classes': 7,
-        #     't_stage_classes': 7,
-        #     'n_stage_classes': 5,
-        #     'm_stage_classes': 4,
+        #     't_stage_classes': 6,
+        #     'n_stage_classes': 4,
+        #     'm_stage_classes': 3,
         #     'missing_flags_dim': 4
         # }
         my_model_init_kwargs = {

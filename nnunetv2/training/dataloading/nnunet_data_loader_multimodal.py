@@ -80,7 +80,7 @@ class nnUNetDataLoaderMultimodal(nnUNetDataLoader):
             else: # 如果不是多模態 Dataset，則沒有臨床資料
                 data, seg, seg_prev, properties = load_result
                 # 對於沒有臨床資料的病例，設置預設值
-                prompt_features = np.zeros(17, dtype=np.float32) # 與 MyModel 的 prompt_dim 匹配
+                prompt_features = np.zeros(14, dtype=np.float32) # 與 MyModel 的 prompt_dim 匹配
                 location_label = -1
                 t_stage_label = -1
                 n_stage_label = -1
@@ -149,7 +149,7 @@ class nnUNetDataLoaderMultimodal(nnUNetDataLoader):
         
         # 提取真正的 missing_flags 標籤 (即 prompt_features 中的最後四維)
         # 這些標籤應該是 0 或 1
-        missing_flags_labels_tensor = prompt_features_tensor[:, 13:17].long()
+        missing_flags_labels_tensor = prompt_features_tensor[:, -4:].long()
 
 
         # 構建 MyModel forward 方法所需的輸入字典
