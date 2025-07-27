@@ -152,9 +152,8 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
             r = [] # 用於儲存異步操作的結果物件
 
             # 遍歷預處理後的數據
-            for preprocessed_item in data_iterator:
+            for i, preprocessed_item in enumerate(data_iterator):
             # [DEBUG]  只推論前三筆檔案!!!!!
-            # for i, preprocessed_item in enumerate(data_iterator):
             #     if i >= 3:  # 只處理前兩個
             #         break
 
