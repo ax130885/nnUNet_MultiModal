@@ -23,94 +23,88 @@ def prepare_clinical_data_for_nnunet(csv_file: str, output_folder: str):
     # 定義各屬性的映射表
     # Location (7 類別)
     location_mapping = {
-        'Missing': 0, 'NONE': 0, # 'NONE' 可能在某些情況下出現，也視為缺失/未知
-        'ascending': 1, 'transverse': 2, 'descending': 3,
-        'sigmoid': 4, 'rectal': 5, 'rectosigmoid': 6
+        'ascending': 0, 'transverse': 1, 'descending': 2,
+        'sigmoid': 3, 'rectal': 4, 'rectosigmoid': 5,
+        'Missing': 6, 'NONE': 6 # 固定使用最後一個index當作缺失類別
     }
-    num_location_classes = 7
+    num_location_classes = len(location_mapping)
 
-    # T-Stage (7 類別，合併 T4a, T4b)
+    # T-Stage (6 類別)
     t_stage_mapping = {
         'T0': 0, 'T1': 1, 'T2': 2, 'T3': 3,
-        'T4a': 4, 'T4b': 5, 'T4': 5, # 將 T4 合併到 T4b
-        'Tx': 6, 'Missing': 6 # 將 Missing 視為 Tx
+        'T4a': 4, 'T4b': 4, 'T4': 4, # 將 T4 合併到 T4b
+        'Tx': 5, 'Missing': 5 # 將 Missing 視為 Tx
     }
-    num_t_stage_classes = 7
+    num_t_stage_classes = len(t_stage_mapping)
 
-    # N-Stage (5 類別，合併 N1a/b/c 和 N2a/b)
+    # N-Stage (4 類別)
     n_stage_mapping = {
         'N0': 0,
         'N1': 1, 'N1a': 1, 'N1b': 1, 'N1c': 1,
         'N2': 2, 'N2a': 2, 'N2b': 2,
         'Nx': 3,
-        'Missing': 4 # 專門的缺失類別
+        'Missing': 3 # 專門的缺失類別
     }
-    num_n_stage_classes = 5
+    num_n_stage_classes = len(n_stage_mapping)
 
-    # M-Stage (4 類別，合併 M1a/b/c)
+    # M-Stage (3 類別)
     m_stage_mapping = {
         'M0': 0,
         'M1': 1, 'M1a': 1, 'M1b': 1, 'M1c': 1,
         'Mx': 2,
-        'Missing': 3 # 專門的缺失類別
+        'Missing': 2 # 專門的缺失類別
     }
-    num_m_stage_classes = 4
+    num_m_stage_classes = len(m_stage_mapping)
 
     print("開始處理臨床資料...")
 
+    # 取出每一個病歷資料
     for index, row in df.iterrows():
         case_id = row['Case_Index'] # 例如 colon_001_0000
 
-        # 初始化標籤和特徵
-        location_label = location_mapping.get(row['Location'], 0) # 如果找不到，預設為 Missing
-        t_stage_label = t_stage_mapping.get(row['T_stage'], 6) # 如果找不到，預設為 Tx
-        n_stage_label = n_stage_mapping.get(row['N_stage'], 4) # 如果找不到，預設為 Missing (NONE)
-        m_stage_label = m_stage_mapping.get(row['M_stage'], 3) # 如果找不到，預設為 Missing (NONE)
+        # 根據上面設定的 mapping 字典，使用get(key) 取得 value 
+        # 其中 key 是表格中的原始字串，value 是 mapping 後的 index
+        # 如果找不到該特徵 設index為缺失類別對應的index
+        location_label = location_mapping.get(row['Location'], num_location_classes - 1) # get(key, default) 如果找不到key對應的value，則返回 default
+        t_stage_label = t_stage_mapping.get(row['T_stage'], num_t_stage_classes - 1)
+        n_stage_label = n_stage_mapping.get(row['N_stage'], num_n_stage_classes - 1) 
+        m_stage_label = m_stage_mapping.get(row['M_stage'], num_m_stage_classes - 1)
 
-        # 構建 prompt_dim=17 的特徵向量
-        prompt_features = np.zeros(17, dtype=np.float32)
+        # 初始化最後保存的表格全為0
+        # 表格維度為 17
+        # location 進行 one-hot 編碼 (num_location_classes)(7)
+        # TNM進行label編碼(3)，獨立的Location+TNM的缺失旗標(4)
+        prompt_features = np.zeros(num_location_classes + 7, dtype=np.float32)
 
-        # 7維 Location One-Hot
-        location_one_hot = np.zeros(num_location_classes, dtype=np.float32)
-        location_one_hot[location_label] = 1.0
-        prompt_features[0:7] = location_one_hot
+        # Location One-Hot
+        location_one_hot = np.zeros(num_location_classes - 1, dtype=np.float32) # 初始化一個獨立的子表格
+        location_one_hot[location_label] = 1.0                              # 將子表格的對應位置設為 1
+        prompt_features[0:num_location_classes - 1] = location_one_hot          # 將子表格填入主表格當中
 
         # 1維 T-stage 數值
-        prompt_features[4] = t_stage_label
+        prompt_features[num_location_classes] = t_stage_label
 
         # 1維 N-stage 數值
-        prompt_features[5] = n_stage_label
+        prompt_features[num_location_classes + 1] = n_stage_label
 
         # 1維 M-stage 數值
-        prompt_features[6] = m_stage_label
+        prompt_features[num_location_classes + 2] = m_stage_label
 
-        # 3維 不確定性標記
-        prompt_features[7] = 1.0 if row['T_stage'] == 'Tx' else 0.0 # T_uncertainty_flag
-        prompt_features[8] = 1.0 if row['N_stage'] == 'Nx' else 0.0 # N_uncertainty_flag
-        prompt_features[9] = 1.0 if row['M_stage'] == 'Mx' else 0.0 # M_uncertainty_flag
-
-        # 4維 缺失標記 (從 CSV 中的 'Missing' 判斷)
-        prompt_features[10] = 1.0 if row['Location'] == 'Missing' else 0.0 # loc_missing_flag
-        prompt_features[11] = 1.0 if row['T_stage'] == 'Missing' else 0.0 # t_stage_missing_flag
-        prompt_features[12] = 1.0 if row['N_stage'] == 'Missing' else 0.0 # n_stage_missing_flag
-        prompt_features[13] = 1.0 if row['M_stage'] == 'Missing' else 0.0 # m_stage_missing_flag
+        # 4維 缺失標記
+        prompt_features[num_location_classes + 3] = 1.0 if (location_label == num_location_classes - 1) else 0.0 # loc_missing_flag
+        prompt_features[num_location_classes + 4] = 1.0 if (t_stage_label == num_t_stage_classes - 1) else 0.0 # t_stage_missing_flag
+        prompt_features[num_location_classes + 5] = 1.0 if (n_stage_label == num_n_stage_classes - 1) else 0.0 # n_stage_missing_flag
+        prompt_features[num_location_classes + 6] = 1.0 if (m_stage_label == num_m_stage_classes - 1) else 0.0 # m_stage_missing_flag
 
         # 判斷是否有臨床資料，用於 MyModel 的 has_clinical_data 標記
-        # 如果所有數值類別（T, N, M）的標籤都是其 '缺失' 類別 (T:Tx/Missing, N:NONE, M:NONE)
-        # 且 Location 也是 Missing/NONE，則認為沒有有效臨床資料
+        # 如果所有特徵都缺失(找不到該欄位 或是欄位填入 Missing, NONE)，則認為沒有有效臨床資料
+        # has_clinical_data 是一個 boolean 值，True才參與訓練，False則不參與訓練
         has_clinical_data = not (
-            location_label == 0 and
-            t_stage_label == 6 and # Tx/Missing
-            n_stage_label == 4 and # Missing (NONE)
-            m_stage_label == 3 and # Missing (NONE)
-            np.all(prompt_features[10:] == 0) # 確保 uncertainty flags 和 missing flags 也都是 0
+            location_label == num_location_classes - 1 and
+            t_stage_label == num_t_stage_classes - 1 and
+            n_stage_label == num_n_stage_classes - 1 and
+            m_stage_label == num_m_stage_classes - 1
         )
-        # 更簡單的判斷：只要 prompt_features 不全為 0，就認為有臨床資料
-        if np.any(prompt_features != 0):
-             has_clinical_data = True
-        else:
-             has_clinical_data = False
-
 
         # 儲存為 .pkl 檔案
         output_data = {
@@ -133,7 +127,7 @@ if __name__ == '__main__':
     # 例如，如果 Dataset101 的完整名稱是 Dataset101_CRCStage
     dataset_name_101 = "Dataset101" # 假設您的 Dataset101 完整名稱
     
-	# 設定nnunet環境變數
+    # 設定nnunet環境變數
     os.environ['nnUNet_raw'] = '/home/admin/yuxin/data/Lab/model/UNet_base/nnunet_ins_data/data_test/nnUNet_raw'
     os.environ['nnUNet_preprocessed'] = '/home/admin/yuxin/data/Lab/model/UNet_base/nnunet_ins_data/data_test/nnUNet_preprocessed'
         
