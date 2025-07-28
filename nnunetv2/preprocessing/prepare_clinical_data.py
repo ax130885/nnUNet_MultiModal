@@ -179,46 +179,26 @@ def prepare_clinical_data_for_nnunet(csv_file: str, output_folder: str):
     )
     print("###############################重要##########################")
 
+import argparse
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="nnUNetv2 臨床資料預處理：將原始臨床 csv 轉成 nnUNet 格式的 pkl 與檢查用 csv。\n\n範例：\n  nnunetv2_prepare_clinical_data --csv /path/to/crcCTlist.csv --output /path/to/output_folder",
+        # nnunetv2_prepare_clinical_data --csv "${nnUNet_raw}/${DATASET_NAME}/crcCTlist.csv" --output "${nnUNet_preprocessed}/${DATASET_NAME}/clinical_data"
+        formatter_class=argparse.RawTextHelpFormatter
+    )
+    parser.add_argument(
+        "--csv", required=True,
+        help="原始臨床資料 csv 路徑（如 crcCTlist.csv）"
+    )
+    parser.add_argument(
+        "--output", required=True,
+        help="預處理後資料儲存資料夾（如 /path/to/clinical_data）"
+    )
+    args = parser.parse_args()
+    # 自動建立 output 資料夾（如果不存在）
+    maybe_mkdir_p(args.output)
+    prepare_clinical_data_for_nnunet(args.csv, args.output)
+
 if __name__ == '__main__':
-    # 這裡您需要根據您的實際路徑設定
-    # 並且將在 nnUNet_preprocessed/DatasetXXX_ColonCancer/clinical_data 下儲存處理後的資料
-    
-    # 請根據您實際的 Dataset101 名稱進行調整
-    # 例如，如果 Dataset101 的完整名稱是 Dataset101_CRCStage
-    dataset_name_101 = "Dataset101" # 假設您的 Dataset101 完整名稱
-    
-    # 設定nnunet環境變數
-    os.environ['nnUNet_raw'] = '/home/admin/yuxin/data/Lab/model/UNet_base/nnunet_ins_data/data_test/nnUNet_raw'
-    os.environ['nnUNet_preprocessed'] = '/home/admin/yuxin/data/Lab/model/UNet_base/nnunet_ins_data/data_test/nnUNet_preprocessed'
-        
-    # 原始的 crcCTlist.csv 路徑
-    crc_ct_list_csv = "/home/admin/yuxin/data/Lab/model/UNet_base/nnunet_ins_data/data_test/nnUNet_raw/Dataset101/crcCTlist.csv"
-
-    # nnUNet 的預處理資料根目錄，從 nnunetv2.paths 導入
-    from nnunetv2.paths import nnUNet_preprocessed
-    
-    # Dataset101 的預處理資料夾路徑
-    dataset101_preprocessed_folder = join(nnUNet_preprocessed, dataset_name_101)
-    
-    # 臨床資料的輸出資料夾，我們在 Dataset101 的預處理資料夾下建立一個子資料夾
-    output_clinical_data_folder = join(dataset101_preprocessed_folder, 'clinical_data')
-    
-    # 運行預處理
-    prepare_clinical_data_for_nnunet(crc_ct_list_csv, output_clinical_data_folder)
-
-    # # 驗證部分資料
-    # print("\n驗證部分資料範例：")
-    # sample_case_id = "colon_001_0000"
-    # sample_data_path = join(output_clinical_data_folder, f"{sample_case_id}.pkl")
-    # if isfile(sample_data_path):
-    #     from batchgenerators.utilities.file_and_folder_operations import load_pickle
-    #     sample_data = load_pickle(sample_data_path)
-    #     print(f"病例 {sample_case_id} 的臨床資料：")
-    #     print(f"  prompt_features: {sample_data['prompt_features']}")
-    #     print(f"  location_label: {sample_data['location_label']}")
-    #     print(f"  t_stage_label: {sample_data['t_stage_label']}")
-    #     print(f"  n_stage_label: {sample_data['n_stage_label']}")
-    #     print(f"  m_stage_label: {sample_data['m_stage_label']}")
-    #     print(f"  has_clinical_data: {sample_data['has_clinical_data']}")
-    # else:
-    #     print(f"未找到病例 {sample_case_id} 的資料。")
+    main()
