@@ -18,18 +18,25 @@ class nnUNetLoggerMultimodal(nnUNetLogger):
         print("nnUNetLoggerMultimodal 初始化。")
         # 添加新的日誌項目
         self.my_fantastic_logging.update({
-            'loc_losses': list(),
-            't_losses': list(),
-            'n_losses': list(),
-            'm_losses': list(),
-            'missing_flags_losses': list(), # 針對缺失標記的損失
+            'train_loc_losses': list(),
+            'train_t_losses': list(),
+            'train_n_losses': list(),
+            'train_m_losses': list(),
+            'train_missing_flags_losses': list(), # 針對缺失標記的損失
 
-            'loc_accs': list(),
-            't_accs': list(),
-            'n_accs': list(),
-            'm_accs': list(),
-            'missing_flags_accs': list() # 針對缺失標記的準確度
+            'val_loc_losses': list(),
+            'val_t_losses': list(),
+            'val_n_losses': list(),
+            'val_m_losses': list(),
+            'val_missing_flags_losses': list(), # 針對缺失標記的損失
+
+            'val_loc_accs': list(),
+            'val_t_accs': list(),
+            'val_n_accs': list(),
+            'val_m_accs': list(),
+            'val_missing_flags_accs': list() # 針對缺失標記的準確度
         })
+
 
     def plot_progress_png(self, output_folder):
         """
