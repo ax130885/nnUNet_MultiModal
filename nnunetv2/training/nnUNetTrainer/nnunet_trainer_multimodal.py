@@ -72,6 +72,7 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
             device (torch.device): 訓練設備 (例如 'cuda')。
         """
         super().__init__(plans, configuration, fold, dataset_json, device)
+
         print("nnUNetTrainerMultimodal 初始化開始...")
 
         # 定義臨床資料資料夾路徑
@@ -113,6 +114,19 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
             'm_stage': 0.0,
             'missing_flags': 0.00 # 權重較低
         }
+
+        # 設定目標權重 (根據你的需求)
+        self.target_clinical_loss_weights = {
+            'location': 1.0,      # 位置分類損失權重最高
+            't_stage': 0.5,       # T 分期權重次之
+            'n_stage': 0.2,       # N 分期權重較低
+            'm_stage': 0.2,       # M 分期權重較低
+            'missing_flags': 0.1  # 缺失標記權重極低
+        }
+
+        self.clinical_loss_start_epoch = 500  # 從第 500 個 epoch 開始增加權重
+        self.clinical_loss_end_epoch = self.num_epochs   # 到最後一個 epoch 達到目標權重
+
         print("nnUNetTrainerMultimodal 初始化完成。")
 
     def initialize(self):
@@ -463,6 +477,11 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
             dist.all_gather_object(losses_tr_total, outputs['loss'])
             loss_here = np.vstack(losses_tr_total).mean()
 
+            # 彙總分割損失
+            seg_losses_tr = [None for _ in range(dist.get_world_size())]
+            dist.all_gather_object(seg_losses_tr, outputs['seg_loss'])
+            seg_loss_here = np.vstack(seg_losses_tr).mean()
+
             # 彙總其他臨床損失
             loc_losses_tr = [None for _ in range(dist.get_world_size())]
             dist.all_gather_object(loc_losses_tr, outputs['loc_loss'])
@@ -486,6 +505,7 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
 
         else:
             loss_here = np.mean(outputs['loss'])
+            seg_loss_here = np.mean(outputs['seg_loss'])
             loc_loss_here = np.mean(outputs['loc_loss'])
             t_loss_here = np.mean(outputs['t_loss'])
             n_loss_here = np.mean(outputs['n_loss'])
@@ -493,8 +513,9 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
             missing_flags_loss_here = np.mean(outputs['missing_flags_loss'])
 
 
-        # 記錄到 logger
-        self.logger.log('train_losses', loss_here, self.current_epoch)
+        # 記錄到 logger（全部使用 train_xxx_losses）
+        self.logger.log('train_total_losses', loss_here, self.current_epoch)
+        self.logger.log('train_seg_losses', seg_loss_here, self.current_epoch)
         self.logger.log('train_loc_losses', loc_loss_here, self.current_epoch)
         self.logger.log('train_t_losses', t_loss_here, self.current_epoch)
         self.logger.log('train_n_losses', n_loss_here, self.current_epoch)
@@ -690,6 +711,11 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
             dist.all_gather_object(losses_val, outputs_collated['loss'])
             loss_here = np.vstack(losses_val).mean()
 
+            # 彙總分割損失
+            seg_losses_val = [None for _ in range(dist.get_world_size())]
+            dist.all_gather_object(seg_losses_val, outputs_collated['seg_loss'])
+            seg_loss_here = np.vstack(seg_losses_val).mean()
+
             # 彙總所有 worker 的臨床損失
             loc_losses_val = [None for _ in range(dist.get_world_size())]
             dist.all_gather_object(loc_losses_val, outputs_collated['loc_loss'])
@@ -736,6 +762,7 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
 
         else:
             loss_here = np.mean(outputs_collated['loss'])
+            seg_loss_here = np.mean(outputs_collated['seg_loss'])
             loc_loss_here = np.mean(outputs_collated['loc_loss'])
             t_loss_here = np.mean(outputs_collated['t_loss'])
             n_loss_here = np.mean(outputs_collated['n_loss'])
@@ -752,10 +779,11 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
         global_dc_per_class = [i for i in [2 * i / (2 * i + j + k) for i, j, k in zip(tp, fp, fn)]]
         mean_fg_dice = np.nanmean(global_dc_per_class)
 
-        # 記錄到 logger
+        # 記錄到 logger（全部使用 val_xxx_losses 與 val_xxx_accs）
         self.logger.log('mean_fg_dice', mean_fg_dice, self.current_epoch)
         self.logger.log('dice_per_class_or_region', global_dc_per_class, self.current_epoch)
         self.logger.log('val_losses', loss_here, self.current_epoch)
+        self.logger.log('val_seg_losses', seg_loss_here, self.current_epoch)
         self.logger.log('val_loc_losses', loc_loss_here, self.current_epoch)
         self.logger.log('val_t_losses', t_loss_here, self.current_epoch)
         self.logger.log('val_n_losses', n_loss_here, self.current_epoch)
@@ -769,29 +797,73 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
         self.logger.log('val_missing_flags_accs', missing_flags_acc_here, self.current_epoch)
 
 
+        # 原本打印指標是在on epoch end，但是因為會延遲變成在下個epoch才印出來
+        # 所以提前打印
+        if self.local_rank == 0:
+            # 額外打印臨床相關指標
+            loc_acc = self.logger.my_fantastic_logging['val_loc_accs'][-1] if len(self.logger.my_fantastic_logging['val_loc_accs']) > 0 else "N/A"
+            t_acc = self.logger.my_fantastic_logging['val_t_accs'][-1] if len(self.logger.my_fantastic_logging['val_t_accs']) > 0 else "N/A"
+            n_acc = self.logger.my_fantastic_logging['val_n_accs'][-1] if len(self.logger.my_fantastic_logging['val_n_accs']) > 0 else "N/A"
+            m_acc = self.logger.my_fantastic_logging['val_m_accs'][-1] if len(self.logger.my_fantastic_logging['val_m_accs']) > 0 else "N/A"
+            missing_flags_acc = self.logger.my_fantastic_logging['val_missing_flags_accs'][-1] if len(self.logger.my_fantastic_logging['val_missing_flags_accs']) > 0 else "N/A"
+
+            self.print_to_log_file(f"Val Location Acc: {np.round(loc_acc, decimals=4)}", add_timestamp=True)
+            self.print_to_log_file(f"Val T Stage Acc: {np.round(t_acc, decimals=4)}", add_timestamp=True)
+            self.print_to_log_file(f"Val N Stage Acc: {np.round(n_acc, decimals=4)}", add_timestamp=True)
+            self.print_to_log_file(f"Val M Stage Acc: {np.round(m_acc, decimals=4)}", add_timestamp=True)
+            self.print_to_log_file(f"Val Missing Flags Acc: {np.round(missing_flags_acc, decimals=4)}", add_timestamp=True)
+
+            # 更新最佳 EMA pseudo Dice 的邏輯已經在父類 on_epoch_end 中處理
+            # 如果需要根據臨床指標決定 best checkpoint，需要修改父類的邏輯或在這裡添加額外判斷
+
+
+
     def on_epoch_end(self):
         """
         在每個 Epoch 結束時記錄時間戳，並處理檢查點儲存。
         覆寫父類的 on_epoch_end 方法。
         """
+        # 更新臨床損失權重
+        self.update_clinical_loss_weights()
+
         super().on_epoch_end() # 調用父類方法處理時間戳、Dice 記錄和檢查點儲存
-        
+
+
+    def update_clinical_loss_weights(self):
+        """
+        根據當前 epoch 動態更新臨床損失權重。
+        在 start_epoch 之前權重為 0。
+        在 start_epoch 到 end_epoch 之間線性增長至目標權重。
+        在 end_epoch 之後保持目標權重。
+        """
+        current_epoch = self.current_epoch
+        start_epoch = self.clinical_loss_start_epoch
+        end_epoch = self.clinical_loss_end_epoch
+
+        if current_epoch < start_epoch:
+            # Epoch 小於起始 epoch，權重保持為 0
+            # self.clinical_loss_weights 已經初始化為 0，無需更改
+            pass
+        elif current_epoch >= start_epoch and current_epoch <= end_epoch:
+            # 在線性增長區間內
+            # 計算增長比例
+            progress_ratio = (current_epoch - start_epoch) / (end_epoch - start_epoch)
+            # 對每個權重項進行線性插值
+            for key in self.clinical_loss_weights.keys():
+                target_weight = self.target_clinical_loss_weights.get(key, 0.0)
+                # 使用線性插值：current_weight = start_weight + ratio * (target_weight - start_weight)
+                # start_weight 是 0
+                self.clinical_loss_weights[key] = 0.0 + progress_ratio * (target_weight - 0.0)
+        else:
+            # Epoch 大於結束 epoch，權重設為目標權重
+            self.clinical_loss_weights = self.target_clinical_loss_weights.copy()
+
+        # 可選：打印當前權重（僅在 rank 0 進程，避免重複打印）
         if self.local_rank == 0:
-            # 額外打印臨床相關指標
-            loc_acc = self.logger.my_fantastic_logging['loc_accs'][-1] if len(self.logger.my_fantastic_logging['loc_accs']) > 0 else "N/A"
-            t_acc = self.logger.my_fantastic_logging['t_accs'][-1] if len(self.logger.my_fantastic_logging['t_accs']) > 0 else "N/A"
-            n_acc = self.logger.my_fantastic_logging['n_accs'][-1] if len(self.logger.my_fantastic_logging['n_accs']) > 0 else "N/A"
-            m_acc = self.logger.my_fantastic_logging['m_accs'][-1] if len(self.logger.my_fantastic_logging['m_accs']) > 0 else "N/A"
-            missing_flags_acc = self.logger.my_fantastic_logging['missing_flags_accs'][-1] if len(self.logger.my_fantastic_logging['missing_flags_accs']) > 0 else "N/A"
+            # 每隔一定 epoch 打印一次，或只在權重開始變化時打印
+            if current_epoch <= start_epoch or current_epoch % 20 == 0 or current_epoch == end_epoch + 1:
+                self.print_to_log_file(f"Epoch {current_epoch}: 更新臨床損失權重為 {self.clinical_loss_weights}")
 
-            self.print_to_log_file(f"Location Acc: {np.round(loc_acc, decimals=4)}", add_timestamp=False)
-            self.print_to_log_file(f"T Stage Acc: {np.round(t_acc, decimals=4)}", add_timestamp=False)
-            self.print_to_log_file(f"N Stage Acc: {np.round(n_acc, decimals=4)}", add_timestamp=False)
-            self.print_to_log_file(f"M Stage Acc: {np.round(m_acc, decimals=4)}", add_timestamp=False)
-            self.print_to_log_file(f"Missing Flags Acc: {np.round(missing_flags_acc, decimals=4)}", add_timestamp=False)
-
-            # 更新最佳 EMA pseudo Dice 的邏輯已經在父類 on_epoch_end 中處理
-            # 如果需要根據臨床指標決定 best checkpoint，需要修改父類的邏輯或在這裡添加額外判斷
 
     def set_deep_supervision_enabled(self, enabled: bool):
         if self.is_ddp:

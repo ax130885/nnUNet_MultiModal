@@ -51,8 +51,8 @@ class nnUNetLoggerMultimodal(nnUNetLogger):
             return
 
         sns.set(font_scale=2.5)
-        # 這裡設 5 個子圖，依序對應：分割損失與dice、臨床損失、臨床acc、epoch耗時、學習率
-        fig, ax_all = plt.subplots(5, 1, figsize=(30, 90))
+        # 這裡設 8 個子圖，依序對應：分割損失與dice、臨床損失、臨床acc、epoch耗時、學習率
+        fig, ax_all = plt.subplots(8, 1, figsize=(30, 8*18))
         x_values = list(range(epoch + 1))
 
         # --- 1. 分割損失和 Dice ---
@@ -71,25 +71,36 @@ class nnUNetLoggerMultimodal(nnUNetLogger):
         ax2.legend(loc=(0.2, 1))
         ax.set_title("Segmentation Loss and Dice")
 
-        # --- 2. 臨床分類損失 ---
-        ax = ax_all[1]
-        ax.plot(x_values, self.my_fantastic_logging['loc_losses'][:epoch + 1], color='purple', ls='-', label="Loc Loss", linewidth=3)
-        ax.plot(x_values, self.my_fantastic_logging['t_losses'][:epoch + 1], color='orange', ls='-', label="T Loss", linewidth=3)
-        ax.plot(x_values, self.my_fantastic_logging['n_losses'][:epoch + 1], color='brown', ls='-', label="N Loss", linewidth=3)
-        ax.plot(x_values, self.my_fantastic_logging['m_losses'][:epoch + 1], color='pink', ls='-', label="M Loss", linewidth=3)
-        ax.plot(x_values, self.my_fantastic_logging['missing_flags_losses'][:epoch + 1], color='gray', ls='-', label="Missing Flags Loss", linewidth=3)
-        ax.set_xlabel("epoch")
-        ax.set_ylabel("Clinical Loss")
-        ax.legend(loc=(0, 1))
-        ax.set_title("Clinical Classification Losses")
+        # --- 2. 臨床分類損失與指標（合併在5張子圖中）---
+        loss_names = ['loc', 't', 'n', 'm', 'missing_flags']
+        for i, loss_name in enumerate(loss_names):
+            ax = ax_all[1+i]
+            ax2 = ax.twinx()
+
+            ax.plot(x_values, self.my_fantastic_logging[f'train_{loss_name}_losses'][:epoch + 1],
+                    color='b', ls='-', label=f'Train {loss_name.upper()} Loss', linewidth=4)
+            ax.plot(x_values, self.my_fantastic_logging[f'val_{loss_name}_losses'][:epoch + 1],
+                    color='r', ls='--', label=f'Val {loss_name.upper()} Loss', linewidth=4)
+
+            ax2.plot(x_values, self.my_fantastic_logging[f'val_{loss_name}_accs'][:epoch + 1],
+                    color='g', ls=':', label=f'{loss_name.upper()} Accuracy', linewidth=3)
+
+            ax.set_xlabel('epoch')
+            ax.set_ylabel(f'{loss_name.upper()} Loss')
+            ax2.set_ylabel(f'{loss_name.upper()} Acc')
+            ax.set_title(f'{loss_name.upper()} Loss & Accuracy')
+
+            ax.legend(loc='upper left')
+            ax2.legend(loc='upper right')
+            ax2.set_ylim(0, 1)  # 準確度範圍 0～1
 
         # --- 3. 臨床分類準確度 ---
-        ax = ax_all[2]
-        ax.plot(x_values, self.my_fantastic_logging['loc_accs'][:epoch + 1], color='purple', ls='--', label="Loc Acc", linewidth=3)
-        ax.plot(x_values, self.my_fantastic_logging['t_accs'][:epoch + 1], color='orange', ls='--', label="T Acc", linewidth=3)
-        ax.plot(x_values, self.my_fantastic_logging['n_accs'][:epoch + 1], color='brown', ls='--', label="N Acc", linewidth=3)
-        ax.plot(x_values, self.my_fantastic_logging['m_accs'][:epoch + 1], color='pink', ls='--', label="M Acc", linewidth=3)
-        ax.plot(x_values, self.my_fantastic_logging['missing_flags_accs'][:epoch + 1], color='gray', ls='--', label="Missing Flags Acc", linewidth=3)
+        ax = ax_all[5]
+        ax.plot(x_values, self.my_fantastic_logging['val_loc_accs'][:epoch + 1], color='purple', ls='--', label="Loc Acc", linewidth=3)
+        ax.plot(x_values, self.my_fantastic_logging['val_t_accs'][:epoch + 1], color='orange', ls='--', label="T Acc", linewidth=3)
+        ax.plot(x_values, self.my_fantastic_logging['val_n_accs'][:epoch + 1], color='brown', ls='--', label="N Acc", linewidth=3)
+        ax.plot(x_values, self.my_fantastic_logging['val_m_accs'][:epoch + 1], color='pink', ls='--', label="M Acc", linewidth=3)
+        ax.plot(x_values, self.my_fantastic_logging['val_missing_flags_accs'][:epoch + 1], color='gray', ls='--', label="Missing Flags Acc", linewidth=3)
         ax.set_xlabel("epoch")
         ax.set_ylabel("Clinical Accuracy")
         ax.legend(loc=(0, 1))
@@ -97,7 +108,7 @@ class nnUNetLoggerMultimodal(nnUNetLogger):
         ax.set_title("Clinical Classification Accuracies")
 
         # --- 4. Epoch 耗時 ---
-        ax = ax_all[3]
+        ax = ax_all[6]
         ax.plot(x_values, [i - j for i, j in zip(self.my_fantastic_logging['epoch_end_timestamps'][:epoch + 1],
                                                 self.my_fantastic_logging['epoch_start_timestamps'])][:epoch + 1], color='b',
                 ls='-', label="epoch duration", linewidth=4)
@@ -107,7 +118,7 @@ class nnUNetLoggerMultimodal(nnUNetLogger):
         ax.set_title("Epoch Duration")
 
         # --- 5. 學習率 ---
-        ax = ax_all[4]
+        ax = ax_all[7]
         ax.plot(x_values, self.my_fantastic_logging['lrs'][:epoch + 1], color='b', ls='-', label="learning rate", linewidth=4)
         ax.set_xlabel("epoch")
         ax.set_ylabel("learning rate")
