@@ -495,11 +495,11 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
 
         # 記錄到 logger
         self.logger.log('train_losses', loss_here, self.current_epoch)
-        self.logger.log('loc_losses', loc_loss_here, self.current_epoch)
-        self.logger.log('t_losses', t_loss_here, self.current_epoch)
-        self.logger.log('n_losses', n_loss_here, self.current_epoch)
-        self.logger.log('m_losses', m_loss_here, self.current_epoch)
-        self.logger.log('missing_flags_losses', missing_flags_loss_here, self.current_epoch)
+        self.logger.log('train_loc_losses', loc_loss_here, self.current_epoch)
+        self.logger.log('train_t_losses', t_loss_here, self.current_epoch)
+        self.logger.log('train_n_losses', n_loss_here, self.current_epoch)
+        self.logger.log('train_m_losses', m_loss_here, self.current_epoch)
+        self.logger.log('train_missing_flags_losses', missing_flags_loss_here, self.current_epoch)
 
 
     def validation_step(self, batch: dict) -> dict:
@@ -756,17 +756,17 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
         self.logger.log('mean_fg_dice', mean_fg_dice, self.current_epoch)
         self.logger.log('dice_per_class_or_region', global_dc_per_class, self.current_epoch)
         self.logger.log('val_losses', loss_here, self.current_epoch)
-        self.logger.log('loc_losses', loc_loss_here, self.current_epoch)
-        self.logger.log('t_losses', t_loss_here, self.current_epoch)
-        self.logger.log('n_losses', n_loss_here, self.current_epoch)
-        self.logger.log('m_losses', m_loss_here, self.current_epoch)
-        self.logger.log('missing_flags_losses', missing_flags_loss_here, self.current_epoch)
+        self.logger.log('val_loc_losses', loc_loss_here, self.current_epoch)
+        self.logger.log('val_t_losses', t_loss_here, self.current_epoch)
+        self.logger.log('val_n_losses', n_loss_here, self.current_epoch)
+        self.logger.log('val_m_losses', m_loss_here, self.current_epoch)
+        self.logger.log('val_missing_flags_losses', missing_flags_loss_here, self.current_epoch)
 
-        self.logger.log('loc_accs', loc_acc_here, self.current_epoch)
-        self.logger.log('t_accs', t_acc_here, self.current_epoch)
-        self.logger.log('n_accs', n_acc_here, self.current_epoch)
-        self.logger.log('m_accs', m_acc_here, self.current_epoch)
-        self.logger.log('missing_flags_accs', missing_flags_acc_here, self.current_epoch)
+        self.logger.log('val_loc_accs', loc_acc_here, self.current_epoch)
+        self.logger.log('val_t_accs', t_acc_here, self.current_epoch)
+        self.logger.log('val_n_accs', n_acc_here, self.current_epoch)
+        self.logger.log('val_m_accs', m_acc_here, self.current_epoch)
+        self.logger.log('val_missing_flags_accs', missing_flags_acc_here, self.current_epoch)
 
 
     def on_epoch_end(self):
