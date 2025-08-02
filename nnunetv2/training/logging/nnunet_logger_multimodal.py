@@ -81,10 +81,10 @@ class nnUNetLoggerMultimodal(nnUNetLogger):
             ax.plot(x_values, self.my_fantastic_logging[f'train_{loss_name}_losses'][:epoch + 1],
                     color='b', ls='-', label=f'Train {loss_name.upper()} Loss', linewidth=4)
             ax.plot(x_values, self.my_fantastic_logging[f'val_{loss_name}_losses'][:epoch + 1],
-                    color='r', ls='--', label=f'Val {loss_name.upper()} Loss', linewidth=4)
+                    color='r', ls='-', label=f'Val {loss_name.upper()} Loss', linewidth=4)
 
             ax2.plot(x_values, self.my_fantastic_logging[f'val_{loss_name}_accs'][:epoch + 1],
-                    color='g', ls=':', label=f'{loss_name.upper()} Accuracy', linewidth=3)
+                    color='g', ls='-', label=f'{loss_name.upper()} Accuracy', linewidth=3)
 
             ax.set_xlabel('epoch')
             ax.set_ylabel(f'{loss_name.upper()} Loss')
@@ -97,10 +97,10 @@ class nnUNetLoggerMultimodal(nnUNetLogger):
 
         # --- 3. 臨床分類準確度 ---
         ax = ax_all[5]
-        ax.plot(x_values, self.my_fantastic_logging['val_loc_accs'][:epoch + 1], color='purple', ls='--', label="Loc Acc", linewidth=3)
+        ax.plot(x_values, self.my_fantastic_logging['val_loc_accs'][:epoch + 1], color='purple', ls='-', label="Loc Acc", linewidth=3)
         ax.plot(x_values, self.my_fantastic_logging['val_t_accs'][:epoch + 1], color='orange', ls='--', label="T Acc", linewidth=3)
-        ax.plot(x_values, self.my_fantastic_logging['val_n_accs'][:epoch + 1], color='brown', ls='--', label="N Acc", linewidth=3)
-        ax.plot(x_values, self.my_fantastic_logging['val_m_accs'][:epoch + 1], color='pink', ls='--', label="M Acc", linewidth=3)
+        ax.plot(x_values, self.my_fantastic_logging['val_n_accs'][:epoch + 1], color='brown', ls='-.', label="N Acc", linewidth=3)
+        ax.plot(x_values, self.my_fantastic_logging['val_m_accs'][:epoch + 1], color='pink', ls=':', label="M Acc", linewidth=3)
         ax.set_xlabel("epoch")
         ax.set_ylabel("Clinical Accuracy")
         ax.legend(loc=(0, 1))
