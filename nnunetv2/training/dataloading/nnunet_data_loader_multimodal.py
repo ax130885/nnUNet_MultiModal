@@ -22,78 +22,61 @@ class nnUNetDataLoaderMultimodal(nnUNetDataLoader):
                  batch_size: int,
                  patch_size: Union[List[int], Tuple[int, ...], np.ndarray],
                  final_patch_size: Union[List[int], Tuple[int, ...], np.ndarray],
-                 label_manager, # 從 nnunetv2.utilities.label_handling.label_handling 導入
+                 label_manager,
                  oversample_foreground_percent: float = 0.0,
                  sampling_probabilities: Union[List[int], Tuple[int, ...], np.ndarray] = None,
                  pad_sides: Union[List[int], Tuple[int, ...]] = None,
                  probabilistic_oversampling: bool = False,
-                 transforms=None):
+                 transforms=None,
+                 clinical_drop_probability: float = 0.1):
         """
         初始化多模態資料載入器。
         Args:
             data: 資料集實例 (可以是 nnUNetDatasetMultimodal 或其他 nnUNetDataset)。
             其他參數同 nnUNetDataLoader。
         """
+        # 設定 drop rate
+        self.clinical_drop_probability = clinical_drop_probability
+
         super().__init__(data, batch_size, patch_size, final_patch_size, label_manager,
                          oversample_foreground_percent, sampling_probabilities,
                          pad_sides, probabilistic_oversampling, transforms)
-        print("nnUNetDataLoaderMultimodal 初始化完成。")
+        
+        # 確保傳入的 data 是我們自定義的多模態 Dataset
+        if not isinstance(data, nnUNetDatasetMultimodal):
+             raise TypeError("nnUNetDataLoaderMultimodal 需要 nnUNetDatasetMultimodal 類型的數據集。")
+        
+        # 儲存 label encoder 和 missing flag，供資料增強時使用
+        self.clinical_data_label_encoder = data.clinical_data_label_encoder
+        self.missing_flags = data.missing_flags # 這是你提供的字典
+        print(f"nnUNetDataLoaderMultimodal 初始化完成。有效類別數量=缺失標記: {self.missing_flags}")
+
+
 
     def generate_train_batch(self):
         """
         生成一個訓練批次，包括影像數據、標註和臨床資料。
         覆寫父類的 generate_train_batch 方法。
         """
+        # 取得目前batch的索引列表 例如batch_size=2時，可能是 ['colon_001', 'colon_002']
         selected_keys = self.get_indices()
 
+        # 初始化影像和label
         data_all = np.zeros(self.data_shape, dtype=np.float32)
         seg_all = np.zeros(self.seg_shape, dtype=np.int16)
 
-        # 初始化臨床資料相關的儲存空間
-        # 假設 prompt_features 是 17 維，且其他標籤是單一整數
-        # 使用列表來收集每個病例的臨床數據
-        all_prompt_features = []
-        all_location_labels = []
-        all_t_stage_labels = []
-        all_n_stage_labels = []
-        all_m_stage_labels = []
-        all_has_clinical_data_flags = []
+        # 初始化臨床資料
+        clinical_data = {'location': [], 't_stage': [], 'n_stage': [], 'm_stage': []}
+        clinical_mask = {'location': [], 't_stage': [], 'n_stage': [], 'm_stage': []}
 
+        # j: 第幾次迴圈
+        # i: 當前選中的病例識別符 (索引)
         for j, i in enumerate(selected_keys):
             force_fg = self.get_do_oversample(j)
             
-            # 這裡的 self._data.load_case 會根據實際 Dataset 類型返回不同的結果
-            # 如果是 nnUNetDatasetMultimodal，會返回 clinical_features_dict
-            # 否則只返回 data, seg, seg_prev, properties
-            load_result = self._data.load_case(i)
-            
-            # 判斷是否返回了臨床資料
-            if len(load_result) == 5:
-                data, seg, seg_prev, properties, clinical_features_dict = load_result
-                # 從字典中提取數據
-                prompt_features = clinical_features_dict['prompt_features']
-                location_label = clinical_features_dict['location_label']
-                t_stage_label = clinical_features_dict['t_stage_label']
-                n_stage_label = clinical_features_dict['n_stage_label']
-                m_stage_label = clinical_features_dict['m_stage_label']
-                has_clinical_data = clinical_features_dict['has_clinical_data']
-            else: # 如果不是多模態 Dataset，則沒有臨床資料
-                data, seg, seg_prev, properties = load_result
-                # 對於沒有臨床資料的病例，設置預設值
-                prompt_features = np.zeros(14, dtype=np.float32) # 與 MyModel 的 prompt_dim 匹配
-                location_label = -1
-                t_stage_label = -1
-                n_stage_label = -1
-                m_stage_label = -1
-                has_clinical_data = False
-
-            # 將臨床數據添加到列表中
-            all_prompt_features.append(prompt_features)
-            all_location_labels.append(location_label)
-            all_t_stage_labels.append(t_stage_label)
-            all_n_stage_labels.append(n_stage_label)
-            all_m_stage_labels.append(m_stage_label)
-            all_has_clinical_data_flags.append(has_clinical_data)
+                      
+            # 從 nnUNetDatasetMultimodal 取得影像、標註、臨床資料和 mask
+            data, seg, seg_prev, properties, clinical_data_dict, clinical_mask_bool = self._data.load_case(i)
 
             # 影像裁剪與填充邏輯 (與父類相同)
             shape = data.shape[1:]
@@ -104,22 +87,23 @@ class nnUNetDataLoaderMultimodal(nnUNetDataLoader):
             seg_cropped = crop_and_pad_nd(seg, bbox, -1)
 
             if seg_prev is not None:
-                # 確保 seg_prev 是正確的維度，通常是 (1, D, H, W) 或 (D, H, W)
-                # crop_and_pad_nd 返回的形狀會是 (C, D, H, W)
-                # 如果 seg_prev 已經是 (C, D, H, W) 而不是 (D, H, W)，則不需要 [None]
-                seg_prev_cropped = crop_and_pad_nd(seg_prev, bbox, -1)
-                if seg_prev_cropped.ndim == 3: # 假設 seg_prev 也是 (D, H, W)
-                    seg_cropped = np.vstack((seg_cropped, seg_prev_cropped[None]))
-                else: # 假設 seg_prev 已經是 (C, D, H, W)
-                    seg_cropped = np.vstack((seg_cropped, seg_prev_cropped))
-                    
+                seg_cropped = np.vstack((seg_cropped, crop_and_pad_nd(seg_prev, bbox, -1)[None]))
             seg_all[j] = seg_cropped
+            
+            
+            for k in ['location', 't_stage', 'n_stage', 'm_stage']:
+                clinical_data[k].append(clinical_data_dict[k])
+                clinical_mask[k].append(clinical_mask_bool[k])
 
+
+                    
+        # 2D 特例
         if self.patch_size_was_2d:
             data_all = data_all[:, :, 0]
             seg_all = seg_all[:, :, 0]
 
-        # 應用數據增強 Transforms (與父類相同)
+
+        # 套用影像的 Augmentation Transforms (與父類相同)
         if self.transforms is not None:
             with torch.no_grad():
                 # from threadpoolctl import threadpool_limits # already imported in nnUNetDataLoader
@@ -139,36 +123,74 @@ class nnUNetDataLoaderMultimodal(nnUNetDataLoader):
                         seg_all = torch.stack(segs)
                     del segs, images
 
-        # 將臨床資料轉換為 PyTorch 張量
-        prompt_features_tensor = torch.from_numpy(np.array(all_prompt_features)).float()
-        location_labels_tensor = torch.from_numpy(np.array(all_location_labels)).long()
-        t_stage_labels_tensor = torch.from_numpy(np.array(all_t_stage_labels)).long()
-        n_stage_labels_tensor = torch.from_numpy(np.array(all_n_stage_labels)).long()
-        m_stage_labels_tensor = torch.from_numpy(np.array(all_m_stage_labels)).long()
-        has_clinical_data_flags_tensor = torch.from_numpy(np.array(all_has_clinical_data_flags)).bool()
-        
-        # 提取真正的 missing_flags 標籤 (即 prompt_features 中的最後四維)
-        # 這些標籤應該是 0 或 1
-        missing_flags_labels_tensor = prompt_features_tensor[:, -4:].long()
 
+        # --- 新增：對臨床資料進行資料增強 (隨機 Drop) ---
+        # 此時 data_all 和 seg_all 已經是 PyTorch Tensor
+        # clinical_data 和 clinical_mask 還是 Python list (原始格式)
 
-        # 構建 MyModel forward 方法所需的輸入字典
-        model_input = {
-            'data': data_all,
-            'clinical_features': prompt_features_tensor,
-            'has_clinical_data': has_clinical_data_flags_tensor
-        }
+        # 1. 將臨床資料 list 轉換為 PyTorch Tensor (用於高效增強)
+        clinical_data_tensor = {}
+        clinical_mask_tensor = {}
+        for key in clinical_data.keys():
+            # 確保資料是整數類型，適合索引和比較
+            clinical_data_tensor[key] = torch.tensor(clinical_data[key], dtype=torch.long)
+            clinical_mask_tensor[key] = torch.tensor(clinical_mask[key], dtype=torch.bool)
 
-        # 返回批次數據，包括影像、標註和臨床資料標籤
+        # 2. 執行隨機 Drop (使用 Tensor 操作)
+        #    只對原始有效的特徵 (mask=True) 進行 Drop
+        for key in clinical_data_tensor.keys():
+            batch_size = clinical_data_tensor[key].size(0)
+            # 生成隨機數 [B]
+            random_numbers = torch.rand(batch_size)
+            # 生成 Drop mask: 當 random_number < drop_probability 且 原始 mask 為 True 時，Drop
+            drop_mask = (random_numbers < self.clinical_drop_probability) & clinical_mask_tensor[key]
+            # 應用 Drop: 將被選中的特徵值替換為對應的缺失標記
+            clinical_data_tensor[key] = torch.where(
+                drop_mask,
+                torch.tensor(self.missing_flags[key], dtype=clinical_data_tensor[key].dtype),
+                clinical_data_tensor[key]
+            )
+            # 更新 mask: 被 Drop 的特徵現在變為無效 (False)
+            clinical_mask_tensor[key] = clinical_mask_tensor[key] & (~drop_mask)
+
+        # 3. 將處理後的 Tensor 轉換回 Trainer 期望的格式 (dict of lists)
+        #    這是與原始程式碼的主要區別：轉換回來
+        clinical_data_final = {k: v.tolist() for k, v in clinical_data_tensor.items()}
+        clinical_mask_final = {k: v.tolist() for k, v in clinical_mask_tensor.items()}
+        # --- 結束新增 ---
+
+        # 回傳結構
         return {
-            'data': model_input, # 傳遞給模型的是這個字典
-            'target': seg_all, # 標註還是獨立作為 target
-            'clinical_labels': { # 臨床資料的真實標籤，用於計算損失和指標
-                'location': location_labels_tensor,
-                't_stage': t_stage_labels_tensor,
-                'n_stage': n_stage_labels_tensor,
-                'm_stage': m_stage_labels_tensor,
-                'missing_flags': missing_flags_labels_tensor
-            },
-            'keys': selected_keys
+            'data':          data_all, # [B, C, D, H, W] tensor
+            'target':        seg_all, # [B, C, D, H, W] tensor
+            'clinical_data': clinical_data_final, # {[B]} dict of lists, {'location': [B], 't_stage': [B], ...}
+            'clinical_mask': clinical_mask_final, # {[B]} dict of lists, {'location': [B], 't_stage': [B], ...}
+            'keys':          selected_keys # [B] list of identifiers
         }
+
+if __name__ == "__main__":
+    # 測試 nnUNetDataLoaderMultimodal 是否能正確生成批次數據
+    dataset = nnUNetDatasetMultimodal(
+        folder='/mnt/data1/graduate/yuxin/Lab/model/UNet_base/nnunet_ins_data/data_test/nnUNet_preprocessed/Dataset101/nnUNetPlans_3d_fullres',
+        clinical_data_dir='/mnt/data1/graduate/yuxin/Lab/model/UNet_base/nnunet_ins_data/data_test/nnUNet_raw/Dataset101'
+    )
+    from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
+    plans_manager = PlansManager("/mnt/data1/graduate/yuxin/Lab/model/UNet_base/nnunet_ins_data/data_test/nnUNet_preprocessed/Dataset101/nnUNetPlans.json")
+    dataset_json = load_json("/mnt/data1/graduate/yuxin/Lab/model/UNet_base/nnunet_ins_data/data_test/nnUNet_preprocessed/Dataset101/dataset.json")
+    label_manager = plans_manager.get_label_manager(dataset_json)
+
+    data_loader = nnUNetDataLoaderMultimodal(
+        data=dataset,
+        batch_size=2,
+        patch_size=(128, 128, 128),
+        final_patch_size=(128, 128, 128),
+        label_manager=label_manager,  # 假設有一個 label manager
+        oversample_foreground_percent=0.5,
+        transforms=None  # 假設沒有使用任何 transforms
+    )
+    # init的時候 會偷偷多加載一筆資料 所以跑完總共會載入 1 + 2 + 2 = 5 筆資料
+    # 可以在 dataset 的 Load case 加入 print 檢查 (一次只返回一筆資料)
+    batch = data_loader.generate_train_batch()
+    print("------------------------------------------------------")
+    batch = data_loader.generate_train_batch()
+    print("Batch generated successfully:", batch.keys())

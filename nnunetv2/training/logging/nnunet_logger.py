@@ -32,8 +32,14 @@ class nnUNetLogger(object):
         """
         sometimes shit gets messed up. We try to catch that here
         """
+        if key not in self.my_fantastic_logging.keys():
+            print(f"[Logger Debug] key '{key}' 不存在於 my_fantastic_logging，現有 keys: {list(self.my_fantastic_logging.keys())}")
+        elif not isinstance(self.my_fantastic_logging[key], list):
+            print(f"[Logger Debug] key '{key}' 對應的物件不是 list，而是 {type(self.my_fantastic_logging[key])}")
+
         assert key in self.my_fantastic_logging.keys() and isinstance(self.my_fantastic_logging[key], list), \
             'This function is only intended to log stuff to lists and to have one entry per epoch'
+
 
         if self.verbose: print(f'logging {key}: {value} for epoch {epoch}')
 

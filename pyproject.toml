@@ -59,7 +59,7 @@ homepage = "https://github.com/MIC-DKFZ/nnUNet"
 repository = "https://github.com/MIC-DKFZ/nnUNet"
 
 [project.scripts]
-nnunetv2_prepare_clinical_data = "nnunetv2.preprocessing.prepare_clinical_data:main"
+nnunetv2_prepare_clinical_data = "nnunetv2.preprocessing.clinical_data_label_encoder:main"
 nnUNetv2_predict_multimodal = "nnunetv2.inference.nnunet_predictor_multimodal:predict_entry_point_multimodal"
 nnUNetv2_plan_and_preprocess = "nnunetv2.experiment_planning.plan_and_preprocess_entrypoints:plan_and_preprocess_entry"
 nnUNetv2_extract_fingerprint = "nnunetv2.experiment_planning.plan_and_preprocess_entrypoints:extract_fingerprint_entry"

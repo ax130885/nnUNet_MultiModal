@@ -18,23 +18,24 @@ class nnUNetLoggerMultimodal(nnUNetLogger):
         print("nnUNetLoggerMultimodal 初始化。")
         # 添加新的日誌項目
         self.my_fantastic_logging.update({
+            'train_total_losses': list(),
+            'train_seg_losses': list(),
             'train_loc_losses': list(),
             'train_t_losses': list(),
             'train_n_losses': list(),
             'train_m_losses': list(),
-            'train_missing_flags_losses': list(), # 針對缺失標記的損失
 
+            'val_total_losses': list(),
+            'val_seg_losses': list(),
             'val_loc_losses': list(),
             'val_t_losses': list(),
             'val_n_losses': list(),
             'val_m_losses': list(),
-            'val_missing_flags_losses': list(), # 針對缺失標記的損失
 
             'val_loc_accs': list(),
             'val_t_accs': list(),
             'val_n_accs': list(),
             'val_m_accs': list(),
-            'val_missing_flags_accs': list() # 針對缺失標記的準確度
         })
 
 
@@ -58,8 +59,8 @@ class nnUNetLoggerMultimodal(nnUNetLogger):
         # --- 1. 分割損失和 Dice ---
         ax = ax_all[0]
         ax2 = ax.twinx()
-        ax.plot(x_values, self.my_fantastic_logging['train_losses'][:epoch + 1], color='b', ls='-', label="loss_tr", linewidth=4)
-        ax.plot(x_values, self.my_fantastic_logging['val_losses'][:epoch + 1], color='r', ls='-', label="loss_val", linewidth=4)
+        ax.plot(x_values, self.my_fantastic_logging['train_seg_losses'][:epoch + 1], color='b', ls='-', label="loss_tr", linewidth=4)
+        ax.plot(x_values, self.my_fantastic_logging['val_seg_losses'][:epoch + 1], color='r', ls='-', label="loss_val", linewidth=4)
         if len(self.my_fantastic_logging['mean_fg_dice']) > 0:
             ax2.plot(x_values, self.my_fantastic_logging['mean_fg_dice'][:epoch + 1], color='g', ls='dotted', label="pseudo dice", linewidth=3)
         if len(self.my_fantastic_logging['ema_fg_dice']) > 0:
@@ -72,9 +73,9 @@ class nnUNetLoggerMultimodal(nnUNetLogger):
         ax.set_title("Segmentation Loss and Dice")
 
         # --- 2. 臨床分類損失與指標（合併在5張子圖中）---
-        loss_names = ['loc', 't', 'n', 'm', 'missing_flags']
+        loss_names = ['loc', 't', 'n', 'm']
         for i, loss_name in enumerate(loss_names):
-            ax = ax_all[1+i]
+            ax = ax_all[1+i] # ax_all[1] 到 ax_all[4] 分別對應 loc, t, n, m 的損失+準確度
             ax2 = ax.twinx()
 
             ax.plot(x_values, self.my_fantastic_logging[f'train_{loss_name}_losses'][:epoch + 1],
@@ -100,7 +101,6 @@ class nnUNetLoggerMultimodal(nnUNetLogger):
         ax.plot(x_values, self.my_fantastic_logging['val_t_accs'][:epoch + 1], color='orange', ls='--', label="T Acc", linewidth=3)
         ax.plot(x_values, self.my_fantastic_logging['val_n_accs'][:epoch + 1], color='brown', ls='--', label="N Acc", linewidth=3)
         ax.plot(x_values, self.my_fantastic_logging['val_m_accs'][:epoch + 1], color='pink', ls='--', label="M Acc", linewidth=3)
-        ax.plot(x_values, self.my_fantastic_logging['val_missing_flags_accs'][:epoch + 1], color='gray', ls='--', label="Missing Flags Acc", linewidth=3)
         ax.set_xlabel("epoch")
         ax.set_ylabel("Clinical Accuracy")
         ax.legend(loc=(0, 1))

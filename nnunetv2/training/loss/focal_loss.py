@@ -20,17 +20,31 @@ class FocalLoss(nn.Module):
         self.alpha = alpha
         self.reduction = reduction
 
-    def forward(self, input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def forward(self, input: torch.Tensor, target: torch.Tensor, mask: torch.Tensor=None) -> torch.Tensor:
         """
-        計算 Focal Loss。
+        計算 Focal Loss，支援 mask 並自動放大到 batch size 尺度。
         Args:
             input (torch.Tensor): 模型的原始輸出 (logits)，形狀為 [N, C] (N: 批次大小, C: 類別數)。
             target (torch.Tensor): 真實標籤，形狀為 [N]，包含 0 到 C-1 的類別索引。
+            mask (torch.Tensor): 損失遮罩，形狀為 [N]，用於指示哪些樣本應該計算損失。
+                                 例如，對於缺失標記的樣本，可以設置為 False。
         Returns:
             torch.Tensor: 計算出的 Focal Loss 值。
         """
         # 確保 target 是長整型
         target = target.long()
+
+        # 先過濾掉 mask=False 的樣本
+        if mask is not None:
+            mask = mask.to(input.device)
+            valid_idx = mask.bool()
+            input = input[valid_idx]
+            target = target[valid_idx]
+            # 如果全部都是缺失，直接回傳 loss = 0
+            if input.shape[0] == 0:
+                return torch.tensor(0.0, device=input.device)
+
+
 
         # 計算對數機率 (log_softmax) 和機率 (softmax)
         log_prob = F.log_softmax(input, dim=-1)
@@ -63,10 +77,25 @@ class FocalLoss(nn.Module):
             alpha_t = self.alpha.gather(0, target)
             loss = alpha_t * loss
 
+        # 應用 mask
+        if self.reduction == 'masked_mean':
+            if mask is not None:
+                mask = mask.to(loss.device) # 將 mask 轉為與 loss 相同設備
+                loss = loss * mask.float() # 將 mask 轉為 float 類型以進行乘法遮罩
+                valid_count = mask.sum().clamp(min=1.0) # 統計有效樣本數
+            else:
+                raise ValueError("Mask must be provided for 'masked_mean' reduction in focal_loss.py.")
+
+            # 放大到 batch size 尺度 (loss.sum() / valid_count * batch_size)
+            batch_size = loss.shape[0]
+
         # 應用約簡方式
-        if self.reduction == 'mean':
+        if self.reduction == 'masked_mean':  # 將有效值的損失放大到 batch size 尺度
+            scaled_loss = loss.sum() / valid_count * batch_size
+            return scaled_loss
+        elif self.reduction == 'mean': # 直接返回平均損失
             return loss.mean()
-        elif self.reduction == 'sum':
+        elif self.reduction == 'sum': # 把batch的損失加總
             return loss.sum()
-        else: # 'none'
+        else: # 直接返回長度為batch的列表[]
             return loss

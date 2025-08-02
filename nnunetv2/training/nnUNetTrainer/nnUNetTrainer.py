@@ -160,7 +160,7 @@ class nnUNetTrainer(object):
         self.num_input_channels = None  # -> self.initialize()
         self.network = None  # -> self.build_network_architecture()
         self.optimizer = self.lr_scheduler = None  # -> self.initialize
-        self.grad_scaler = GradScaler("cuda") if self.device.type == 'cuda' else None
+        self.grad_scaler = GradScaler("cuda") if self.device.type == 'cuda' else None # 混合精度 AMP, fp16 開關
         self.loss = None  # -> self.initialize
 
         ### Simple logging. Don't take that away from me!
