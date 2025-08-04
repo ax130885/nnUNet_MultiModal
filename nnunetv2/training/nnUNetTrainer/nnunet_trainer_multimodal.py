@@ -1472,7 +1472,7 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
             self.set_deep_supervision_enabled(True) # 重新啟用深度監督
             compute_gaussian.cache_clear() # 清理高斯核快取
 
-    def compute_clinical_metrics(true_labels, pred_labels, mask, num_classes):
+    def compute_clinical_metrics(self, true_labels, pred_labels, mask, num_classes):
         """
         true_labels, pred_labels, mask: list or numpy array, shape [N]
         num_classes: int

@@ -23,9 +23,6 @@ from tqdm import tqdm
 
 import nnunetv2
 from nnunetv2.configuration import default_num_processes
-# 我們不再需要原始的 preprocessing_iterator_fromfiles/fromnpy，因為 DataLoaderMultimodal 會將數據組織成所需格式
-# from nnunetv2.inference.data_iterators import PreprocessAdapterFromNpy, preprocessing_iterator_fromfiles, \
-#     preprocessing_iterator_fromnpy
 
 # 如果創建了新文件，則導入路徑需要調整
 from nnunetv2.inference.data_iterators_multimodal import preprocessing_iterator_fromfiles_multimodal
@@ -51,8 +48,10 @@ from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
 
 
 from nnunetv2.training.nnUNetTrainer.multitask_segmentation_model import MyModel
+from nnunetv2.training.nnUNetTrainer.multitask_model import MyMultiModel
+
 import csv
-import torch.profiler
+from nnunetv2.preprocessing.clinical_data_label_encoder import ClinicalDataLabelEncoder
 
 
 class nnUNetPredictorMultimodal(nnUNetPredictor):
@@ -68,11 +67,52 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
                  device: torch.device = torch.device('cuda'), # 指定運算設備
                  verbose: bool = False,       # 是否輸出詳細日誌
                  verbose_preprocessing: bool = False, # 是否輸出預處理詳細日誌
-                 allow_tqdm: bool = True):    # 是否允許顯示進度條
+                 allow_tqdm: bool = True,
+                 clinical_data_dir: Optional[str] = None):    # 是否允許顯示進度條
         super().__init__(tile_step_size, use_gaussian, use_mirroring,
                          perform_everything_on_device, device, verbose,
                          verbose_preprocessing, allow_tqdm)
+        self.clinical_data_label_encoder = None
+        self.reverse_mappings = None
+        self.missing_flags = None
+        self.clinical_data_dir = clinical_data_dir  # 新增臨床數據目錄參數
+
         print("nnUNetPredictorMultimodal 初始化完成。")
+
+        self.clinical_data_label_encoder = None
+        self.reverse_location_mapping = None
+        self.reverse_t_stage_mapping = None
+        self.reverse_n_stage_mapping = None
+        self.reverse_m_stage_mapping = None
+
+    # 初始化臨床資料編碼器 取得反向 mapping
+    # 初始化臨床資料編碼器 取得反向 mapping
+    def initialize_clinical_encoder(self):
+        """初始化臨床數據編碼器並設置反向映射"""
+        if self.clinical_data_dir:
+            try:
+                self.clinical_data_label_encoder = ClinicalDataLabelEncoder(self.clinical_data_dir)
+                # 從編碼器獲取反向映射
+                self.reverse_mappings = {
+                    'location': self.clinical_data_label_encoder.reverse_location_mapping,
+                    't_stage': self.clinical_data_label_encoder.reverse_t_stage_mapping,
+                    'n_stage': self.clinical_data_label_encoder.reverse_n_stage_mapping,
+                    'm_stage': self.clinical_data_label_encoder.reverse_m_stage_mapping
+                }
+                # 從編碼器獲取缺失標記
+                self.missing_flags = {
+                    'location': self.clinical_data_label_encoder.missing_flag_location,
+                    't_stage': self.clinical_data_label_encoder.missing_flag_t_stage,
+                    'n_stage': self.clinical_data_label_encoder.missing_flag_n_stage,
+                    'm_stage': self.clinical_data_label_encoder.missing_flag_m_stage
+                }
+                print(f"臨床數據編碼器初始化成功，缺失標記: {self.missing_flags}")
+            except Exception as e:
+                print(f"[警告] 無法初始化 ClinicalDataLabelEncoder: {e}")
+                self.clinical_data_label_encoder = None
+                self.reverse_mappings = None
+                self.missing_flags = None
+
 
     @torch.inference_mode()
     def predict_from_data_iterator(self,
@@ -96,34 +136,97 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
         Returns:
             list: 預測結果列表。
         """
+        # 初始化臨床數據編碼器
+        if self.clinical_data_dir:
+            self.initialize_clinical_encoder()
         # 將臨床資料的預測結果 進行 argmax 接著轉換為實際標籤
         def clinical_logits_to_labels(clinical_attr_preds):
-            # 這裡的 reverse dict 要根據你的實際類別順序調整
-            location_reverse = {
-                0: 'Missing', 1: 'ascending', 2: 'transverse', 3: 'descending',
-                4: 'sigmoid', 5: 'rectal', 6: 'rectosigmoid'
-            }
-            t_stage_reverse = {
-                0: 'T0', 1: 'T1', 2: 'T2', 3: 'T3', 4: 'T4a', 5: 'T4b', 6: 'Tx'
-            }
-            n_stage_reverse = {
-                0: 'N0', 1: 'N1', 2: 'N2', 3: 'Nx', 4: 'Missing'
-            }
-            m_stage_reverse = {
-                0: 'M0', 1: 'M1', 2: 'Mx', 3: 'Missing'
-            }
-            loc_idx = int(torch.argmax(clinical_attr_preds['location']).item())
-            t_idx = int(torch.argmax(clinical_attr_preds['t_stage']).item())
-            n_idx = int(torch.argmax(clinical_attr_preds['n_stage']).item())
-            m_idx = int(torch.argmax(clinical_attr_preds['m_stage']).item())
-            missing_flags = (torch.sigmoid(clinical_attr_preds['missing_flags']) > 0.5).int().tolist()
-            return {
-                "Location": location_reverse[loc_idx],
-                "T_stage": t_stage_reverse[t_idx],
-                "N_stage": n_stage_reverse[n_idx],
-                "M_stage": m_stage_reverse[m_idx],
-                "Missing_flags": missing_flags
-            }
+            # 使用反向映射將索引轉回標籤
+            labels = {}
+            
+            if self.reverse_mappings and clinical_attr_preds:
+                try:
+                    # 先獲取 missing_flags 預測 (這決定哪些特徵應被視為缺失)
+                    if 'missing_flags' in clinical_attr_preds:
+                        missing_probs = torch.sigmoid(clinical_attr_preds['missing_flags']).cpu().numpy()
+                        missing_flags = (missing_probs > 0.5).tolist()
+                    else:
+                        missing_flags = [False, False, False, False]
+                    
+                    # 獲取最大概率的類別索引
+                    loc_idx = int(torch.argmax(clinical_attr_preds['location']).item())
+                    t_idx = int(torch.argmax(clinical_attr_preds['t_stage']).item())
+                    n_idx = int(torch.argmax(clinical_attr_preds['n_stage']).item())
+                    m_idx = int(torch.argmax(clinical_attr_preds['m_stage']).item())
+                    
+                    # 計算各特徵的分布概率，用於多樣性檢查
+                    loc_probs = torch.softmax(clinical_attr_preds['location'], dim=0).cpu().numpy()
+                    t_probs = torch.softmax(clinical_attr_preds['t_stage'], dim=0).cpu().numpy()
+                    n_probs = torch.softmax(clinical_attr_preds['n_stage'], dim=0).cpu().numpy()
+                    m_probs = torch.softmax(clinical_attr_preds['m_stage'], dim=0).cpu().numpy()
+                    
+                    # 檢查預測的多樣性 - 如果最高概率低於閾值，可能表示模型不確定
+                    loc_uncertain = np.max(loc_probs) < 0.7
+                    t_uncertain = np.max(t_probs) < 0.7
+                    n_uncertain = np.max(n_probs) < 0.7
+                    m_uncertain = np.max(m_probs) < 0.7
+                    
+                    # 記錄原始索引和缺失值標記
+                    loc_missing_idx = self.missing_flags.get('location', 6)
+                    t_missing_idx = self.missing_flags.get('t_stage', 5)
+                    n_missing_idx = self.missing_flags.get('n_stage', 3)
+                    m_missing_idx = self.missing_flags.get('m_stage', 2)
+                    
+                    # 如果 missing_flag 為 True 或特徵索引等於缺失值索引，則標記為 "Missing"
+                    loc_label = "Missing" if (missing_flags[0] or loc_idx == loc_missing_idx) else self.reverse_mappings['location'].get(loc_idx, 'Unknown')
+                    t_label = "Missing" if (missing_flags[1] or t_idx == t_missing_idx) else self.reverse_mappings['t_stage'].get(t_idx, 'Unknown')
+                    n_label = "Missing" if (missing_flags[2] or n_idx == n_missing_idx) else self.reverse_mappings['n_stage'].get(n_idx, 'Unknown')
+                    m_label = "Missing" if (missing_flags[3] or m_idx == m_missing_idx) else self.reverse_mappings['m_stage'].get(m_idx, 'Unknown')
+                    
+                    # 組織最終結果
+                    labels = {
+                        "Case_Index": "",  # 會在外部設置
+                        "Location": loc_label,
+                        "T_stage": t_label,
+                        "N_stage": n_label,
+                        "M_stage": m_label,
+                        "Missing_flags": missing_flags,
+                        # 添加額外診斷資訊以便分析
+                        "Debug_Info": {
+                            "loc_probs": loc_probs.tolist(),
+                            "t_probs": t_probs.tolist(),
+                            "n_probs": n_probs.tolist(),
+                            "m_probs": m_probs.tolist(),
+                            "loc_uncertain": loc_uncertain,
+                            "t_uncertain": t_uncertain,
+                            "n_uncertain": n_uncertain,
+                            "m_uncertain": m_uncertain,
+                        }
+                    }
+                    
+                except Exception as e:
+                    print(f"反向映射標籤時出錯: {e}")
+                    # 預設值
+                    labels = {
+                        "Case_Index": "",
+                        "Location": "Unknown",
+                        "T_stage": "Unknown",
+                        "N_stage": "Unknown",
+                        "M_stage": "Unknown",
+                        "Missing_flags": [False, False, False, False]
+                    }
+            else:
+                # 預設值
+                labels = {
+                    "Case_Index": "",
+                    "Location": "Unknown",
+                    "T_stage": "Unknown",
+                    "N_stage": "Unknown",
+                    "M_stage": "Unknown",
+                    "Missing_flags": [False, False, False, False]
+                }
+                
+            return labels
 
 
         # 保存臨床預測結果 txt
@@ -132,19 +235,66 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
             labels = clinical_logits_to_labels(clinical_attr_preds)
             with open(txt_path, "w") as f:
                 for k, v in labels.items():
-                    f.write(f"{k}: {v}\n")
+                    if k != "Case_Index":  # 跳過案例ID，因為它是從文件名中生成的
+                        f.write(f"{k}: {v}\n")
 
         # 保存臨床預測結果 csv
         def save_clinical_prediction_csv(csv_path, all_clinical_results):
             if not all_clinical_results:
                 return
-            fieldnames = list(all_clinical_results[0].keys())
+                
+            # 分析臨床預測的多樣性
+            class_counts = {
+                'Location': {},
+                'T_stage': {},
+                'N_stage': {},
+                'M_stage': {},
+            }
+            
+            # 計算每個類別的出現次數
+            for result in all_clinical_results:
+                for key in class_counts.keys():
+                    if key in result:
+                        value = result[key]
+                        if value not in class_counts[key]:
+                            class_counts[key][value] = 0
+                        class_counts[key][value] += 1
+            
+            # 打印類別分佈
+            print("\n=== 臨床預測類別分佈 ===")
+            for key, counts in class_counts.items():
+                print(f"{key}: {counts}")
+            
+            # 如果某個類別的預測結果過於單一，發出警告
+            for key, counts in class_counts.items():
+                if len(counts) == 1:
+                    print(f"警告: {key} 的預測結果全部相同 ({list(counts.keys())[0]})")
+                elif len(counts) <= 2 and len(all_clinical_results) > 10:
+                    print(f"警告: {key} 的預測結果多樣性較低，僅有 {len(counts)} 個不同值")
+            
+            # 移除調試信息以便CSV保存
+            cleaned_results = []
+            for result in all_clinical_results:
+                cleaned_result = {k: v for k, v in result.items() if k != 'Debug_Info'}
+                cleaned_results.append(cleaned_result)
+                
+            # 保存CSV
+            fieldnames = list(cleaned_results[0].keys())
             with open(csv_path, "w", newline="") as csvfile:
                 writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
                 writer.writeheader()
-                for row in all_clinical_results:
+                for row in cleaned_results:
                     writer.writerow(row)
+                    
+            # 另外保存一個調試信息版本（如果存在）
+            if 'Debug_Info' in all_clinical_results[0]:
+                debug_csv_path = csv_path.replace('.csv', '_debug.json')
+                import json
+                with open(debug_csv_path, 'w') as f:
+                    json.dump(all_clinical_results, f, indent=4)
+                print(f"診斷資訊已保存到: {debug_csv_path}")
 
+        # 從這邊開始 才比較類似原生的程式
         # 使用 'spawn' 上下文創建進程池，以避免 CUDA 相關問題
         all_clinical_results = []
         with multiprocessing.get_context("spawn").Pool(num_processes_segmentation_export) as export_pool:
@@ -152,6 +302,7 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
             r = [] # 用於儲存異步操作的結果物件
 
             # 遍歷預處理後的數據
+            print("開始處理預處理後的數據...")
             for i, preprocessed_item in enumerate(data_iterator):
             # [DEBUG]  只推論前三筆檔案!!!!!
             #     if i >= 3:  # 只處理前兩個
@@ -164,13 +315,27 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
                 # --- 性能分析結束 ---
 
                 # 從預處理結果中提取影像數據和臨床特徵
-                # preprocessed_item['data'] 現在是一個字典
-                image_data = preprocessed_item['data']['data']
-                clinical_features = preprocessed_item['data']['clinical_features']
-                has_clinical_data = preprocessed_item['data']['has_clinical_data'] # 標記是否有臨床資料
+                image_data = preprocessed_item['data']  # 影像數據，已經預處理好的 numpy 陣列
+                clinical_data = preprocessed_item['clinical_data']  # 臨床特徵字典
+                clinical_mask = preprocessed_item['clinical_mask']  # 臨床特徵掩碼字典
+                
+                # 將 numpy 轉換為 tensor (本來在iterator就已經是 tensor 了)
+                # image_tensor = torch.from_numpy(image_data).float()
+                
+                # 將臨床特徵轉換為 tensor 並移動到正確的設備上
+                clinical_features = {
+                    'location': torch.tensor([clinical_data['location']], dtype=torch.long),
+                    't_stage': torch.tensor([clinical_data['t_stage']], dtype=torch.long),
+                    'n_stage': torch.tensor([clinical_data['n_stage']], dtype=torch.long),
+                    'm_stage': torch.tensor([clinical_data['m_stage']], dtype=torch.long)
+                }
+                
+                # 生成是否有臨床數據的標記，用於之後的處理
+                has_clinical_data = any(clinical_mask.values())
+                has_clinical_data_tensor = torch.tensor([has_clinical_data], dtype=torch.bool)
 
-                ofile = preprocessed_item['ofile'] # 輸出文件名 (如果存在)
-                properties = preprocessed_item['data_properties'] # 原始影像屬性
+                ofile = preprocessed_item['ofile']  # 輸出文件名 (如果存在)
+                properties = preprocessed_item['properties']  # 原始影像屬性
 
                 if ofile is not None:
                     print(f'\n正在預測 {os.path.basename(ofile)}:')
@@ -181,7 +346,7 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
                 # 流量控制：避免 GPU 預測過快導致導出進程阻塞
                 proceed = not check_workers_alive_and_busy(export_pool, worker_list, r, allowed_num_queued=4)
                 while not proceed:
-                    sleep(0.05) # 等待 100 毫秒
+                    sleep(0.05) # 等待 50 毫秒
                     proceed = not check_workers_alive_and_busy(export_pool, worker_list, r, allowed_num_queued=4)
                 
                 # 呼叫修改後的預測邏輯，同時傳入影像數據和臨床特徵
@@ -190,7 +355,7 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
                     image_data, clinical_features
                 )
                 
-                #  將分割預測結果的匯出工作放入背景行程池中執行 (非同步)
+                # 將分割預測結果的匯出工作放入背景行程池中執行 (非同步)
                 prediction_seg_logits = prediction_seg_logits.cpu().detach().numpy()
 
                 # 保存臨床預測 txt
@@ -200,9 +365,8 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
                 # 收集到 all_clinical_results
                 case_id = os.path.basename(ofile) if ofile is not None else f"case_{i}"
                 labels = clinical_logits_to_labels(clinical_attr_preds)
-                result_row = {"Case_Index": case_id}
-                result_row.update(labels)
-                all_clinical_results.append(result_row)
+                labels["Case_Index"] = case_id  # 設置案例ID
+                all_clinical_results.append(labels)
 
                 # segmentation 匯出
                 if ofile is not None:
@@ -221,7 +385,7 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
                         export_pool.starmap_async(
                             self._collate_prediction_outputs_for_return, # 新增一個輔助函數來收集所有返回
                             ((prediction_seg_logits, self.plans_manager, self.configuration_manager, self.label_manager,
-                              properties, save_probabilities, clinical_attr_preds, has_clinical_data),) # 傳遞臨床預測結果及標誌
+                              properties, save_probabilities, clinical_attr_preds, has_clinical_data_tensor),) # 傳遞臨床預測結果及標誌
                         )
                     )
 
@@ -287,14 +451,15 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
         }
 
     @torch.inference_mode()
-    def predict_logits_and_attributes_from_preprocessed_data(self, data: torch.Tensor, clinical_features: torch.Tensor) -> Tuple[torch.Tensor, dict]:
+    def predict_logits_and_attributes_from_preprocessed_data(self, data: torch.Tensor, clinical_features: dict) -> Tuple[torch.Tensor, dict]:
         """
         重要！如果是級聯模型，前階段分割必須已以 one-hot 編碼形式堆疊在影像頂部！
         此方法同時返回分割的 logits 和臨床屬性預測的 logits。
         
         Args:
             data (torch.Tensor): 預處理後的影像數據 (4D 張量)。
-            clinical_features (torch.Tensor): 預處理後的臨床特徵數據 (批次, prompt_dim)。
+            clinical_features (dict): 預處理後的臨床特徵字典，包含四個特徵：
+                                     {'location': tensor, 't_stage': tensor, 'n_stage': tensor, 'm_stage': tensor}
             
         Returns:
             Tuple[torch.Tensor, dict]: 包含分割 logits 和臨床屬性 logits 字典的元組。
@@ -304,7 +469,7 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
 
         prediction_seg = None
         # 初始化臨床屬性預測的累加器
-        prediction_attrs = {k: None for k in ['location', 't_stage', 'n_stage', 'm_stage', 'missing_flags']}
+        prediction_cli = {k: None for k in ['location', 't_stage', 'n_stage', 'm_stage', 'missing_flags']}
 
         # 模型集成：遍歷所有參數集（多折交叉驗證）
         for params in self.list_of_parameters:
@@ -315,39 +480,46 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
                 self.network._orig_mod.load_state_dict(params) # 處理編譯後模型
 
             # 呼叫修改後的 predict_sliding_window_return_logits，傳入影像和臨床特徵
-            seg_logits_single_model, attr_logits_single_model = self.predict_sliding_window_return_logits(data, clinical_features)
+            seg_logits_single_model, cli_logits_single_model = self.predict_sliding_window_return_logits(
+                data,
+                clinical_features['location'],
+                clinical_features['t_stage'],
+                clinical_features['n_stage'],
+                clinical_features['m_stage']
+            )
 
             # 累加預測結果
             if prediction_seg is None:
                 prediction_seg = seg_logits_single_model.to('cpu')
-                for k, v in attr_logits_single_model.items():
-                    prediction_attrs[k] = v.to('cpu')
+                for k, v in cli_logits_single_model.items():
+                    prediction_cli[k] = v.to('cpu')
             else:
                 prediction_seg += seg_logits_single_model.to('cpu')
-                for k, v in attr_logits_single_model.items():
-                    prediction_attrs[k] += v.to('cpu')
+                for k, v in cli_logits_single_model.items():
+                    prediction_cli[k] += v.to('cpu')
         
         # 計算平均預測 (如果有多個模型)
         if len(self.list_of_parameters) > 1:
             prediction_seg /= len(self.list_of_parameters)
-            for k in prediction_attrs.keys():
-                if prediction_attrs[k] is not None: # 確保屬性存在
-                    prediction_attrs[k] /= len(self.list_of_parameters)
+            for k in prediction_cli.keys():
+                if prediction_cli[k] is not None: # 確保屬性存在
+                    prediction_cli[k] /= len(self.list_of_parameters)
 
         if self.verbose:
             print('預測完成')
         torch.set_num_threads(n_threads) # 恢復線程設置
-        return prediction_seg, prediction_attrs
+        return prediction_seg, prediction_cli
 
     @torch.inference_mode()
-    def _internal_maybe_mirror_and_predict(self, x: torch.Tensor, clinical_features: torch.Tensor) -> Tuple[torch.Tensor, dict]:
+    def _internal_maybe_mirror_and_predict(self, x: torch.Tensor, clinical_features: dict) -> Tuple[torch.Tensor, dict]:
         """
         執行鏡像增強預測（內部方法），同時考慮臨床特徵。
         根據配置決定是否使用測試時數據增強。臨床特徵不進行鏡像操作。
         
         Args:
             x (torch.Tensor): 輸入影像批次。
-            clinical_features (torch.Tensor): 輸入臨床特徵批次。
+            clinical_features (dict): 輸入臨床特徵字典，包含四個特徵：
+                                     {'location': tensor, 't_stage': tensor, 'n_stage': tensor, 'm_stage': tensor}
             
         Returns:
             Tuple[torch.Tensor, dict]: 鏡像增強後的分割 logits 和臨床屬性 logits 字典。
@@ -355,8 +527,25 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
         mirror_axes = self.allowed_mirroring_axes if self.use_mirroring else None
         
         # 初始預測 (使用原始影像和臨床特徵)
-        seg_prediction, attr_prediction = self.network(x, clinical_features)
-        # assert isinstance(seg_prediction, torch.Tensor), f"seg_prediction type: {type(seg_prediction)}"
+        # 根據你的模型實現方式，需要分別傳入四個臨床特徵
+        seg_prediction, cli_prediction = self.network(
+            x,
+            clinical_features['location'].to(self.device),
+            clinical_features['t_stage'].to(self.device),
+            clinical_features['n_stage'].to(self.device),
+            clinical_features['m_stage'].to(self.device)
+        )
+
+        # 處理 deep_supervision 返回的列表
+        # 若 seg_prediction 是列表，取第一個元素（最高解析度的輸出）
+        if isinstance(seg_prediction, list):
+            seg_prediction = seg_prediction[0]
+        
+        # 若 cli_prediction 包含列表，取每個列表的第一個元素
+        if isinstance(cli_prediction, dict):
+            for k in cli_prediction.keys():
+                if isinstance(cli_prediction[k], list) and len(cli_prediction[k]) > 0:
+                    cli_prediction[k] = cli_prediction[k][0]
 
         # 鏡像增強處理
         if mirror_axes is not None:
@@ -375,28 +564,43 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
                 mirrored_x = torch.flip(x, axes)
 
                 # 臨床特徵不進行鏡像，直接傳遞
-                m_seg_pred, m_attr_pred = self.network(mirrored_x, clinical_features)
+                m_seg_pred, m_cli_pred = self.network(
+                    mirrored_x,
+                    clinical_features['location'].to(self.device),
+                    clinical_features['t_stage'].to(self.device),
+                    clinical_features['n_stage'].to(self.device),
+                    clinical_features['m_stage'].to(self.device)
+                )
+                
+                # 處理 deep_supervision 返回的列表
+                if isinstance(m_seg_pred, list):
+                    m_seg_pred = m_seg_pred[0]
+                
+                if isinstance(m_cli_pred, dict):
+                    for k in m_cli_pred.keys():
+                        if isinstance(m_cli_pred[k], list) and len(m_cli_pred[k]) > 0:
+                            m_cli_pred[k] = m_cli_pred[k][0]
 
                 # 分割結果需要反向鏡像後累加
                 seg_prediction += torch.flip(m_seg_pred, axes)
 
                 # 臨床屬性結果不需要反向鏡像，直接累加
-                for k in attr_prediction.keys():
-                    if attr_prediction[k] is not None: # 確保屬性存在
-                        attr_prediction[k] += m_attr_pred[k]
+                for k in cli_prediction.keys():
+                    if cli_prediction[k] is not None: # 確保屬性存在
+                        cli_prediction[k] += m_cli_pred[k]
 
             # 計算加權平均
             seg_prediction /= (len(axes_combinations) + 1)
-            for k in attr_prediction.keys():
-                if attr_prediction[k] is not None: # 確保屬性存在
-                    attr_prediction[k] /= (len(axes_combinations) + 1)
+            for k in cli_prediction.keys():
+                if cli_prediction[k] is not None: # 確保屬性存在
+                    cli_prediction[k] /= (len(axes_combinations) + 1)
 
-        return seg_prediction, attr_prediction
+        return seg_prediction, cli_prediction
 
     @torch.inference_mode()
     def _internal_predict_sliding_window_return_logits(self,
                                                        data: torch.Tensor,
-                                                       clinical_features: torch.Tensor, # 新增臨床特徵輸入
+                                                       clinical_features: dict, # 接收臨床特徵字典
                                                        slicers,
                                                        do_on_device: bool = True):
         """
@@ -405,7 +609,8 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
         
         Args:
             data (torch.Tensor): 填充後的影像數據。
-            clinical_features (torch.Tensor): 該案例的臨床特徵數據。
+            clinical_features (dict): 該案例的臨床特徵字典，包含四個臨床特徵。
+                                     {'location': tensor, 't_stage': tensor, 'n_stage': tensor, 'm_stage': tensor}
             slicers: 滑動窗口切片器列表。
             do_on_device (bool): 是否在設備 (GPU) 上執行所有操作。
             
@@ -413,17 +618,18 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
             Tuple[torch.Tensor, dict]: 分割 logits 和臨床屬性 logits 字典。
         """
         predicted_logits_seg = n_predictions = prediction_seg = gaussian = workon_image = None
-        predicted_logits_attrs = {k: None for k in ['location', 't_stage', 'n_stage', 'm_stage', 'missing_flags']}
+        predicted_logits_cli = {k: None for k in ['location', 't_stage', 'n_stage', 'm_stage', 'missing_flags']}
         
         results_device = self.device if do_on_device else torch.device('cpu') # 結果儲存設備
 
-        def producer(d, slh, q, clinical_f):
+        def producer(d, slh, q, cli_features):
             """生產者函數：將影像切片和臨床特徵放入隊列"""
             for s in slh:
                 # 將影像切片和臨床特徵複製到 GPU 並放入隊列
+                # 臨床特徵是對整個 case 有效，所以每個 patch 都傳遞相同的臨床特徵
                 q.put((
                     torch.clone(d[s][None], memory_format=torch.contiguous_format).to(self.device),
-                    clinical_f.to(self.device), # 臨床特徵是對整個 case 有效，所以每個 patch 都傳遞
+                    cli_features, # 將所有臨床特徵直接傳遞
                     s
                 ))
             q.put('end') # 結束標記
@@ -455,27 +661,37 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
             # 預分配預測次數的記憶體空間，用於加權平均
             n_predictions = torch.zeros(data.shape[1:], dtype=torch.half, device=results_device)
 
-            # 為臨床屬性預測分配空間 (由於臨床屬性預測通常是針對整個案例而不是單個 patch，
-            # 我們只需在第一次有效預測時獲取其結果)
-            # 這裡假設 `MyModel` 會在 `forward` 中根據 `patch_size` 確定輸出尺寸
-            # 為了通用性，我們從 `network.init_kwargs` 中獲取類別數量
+            # 為臨床屬性預測分配空間
+            # 我們從模型的 init_kwargs 中獲取類別數量或使用預設值
             # 注意：這裡的 `network` 可能是 DDP 的 `module` 或 `_orig_mod`
             if isinstance(self.network, (nn.parallel.DistributedDataParallel, OptimizedModule)):
                 model_base = self.network.module if isinstance(self.network, DistributedDataParallel) else self.network._orig_mod
-                attr_init_kwargs = model_base.init_kwargs
+                attr_init_kwargs = getattr(model_base, 'init_kwargs', None)
             else:
-                attr_init_kwargs = self.network.init_kwargs # 假設 MyModel 有 init_kwargs 屬性
+                attr_init_kwargs = getattr(self.network, 'init_kwargs', None)
 
-            attr_output_shapes = {
-                'location': (attr_init_kwargs.get('location_classes', 7),),
-                't_stage': (attr_init_kwargs.get('t_stage_classes', 6),),
-                'n_stage': (attr_init_kwargs.get('n_stage_classes', 4),),
-                'm_stage': (attr_init_kwargs.get('m_stage_classes', 3),),
-                'missing_flags': (attr_init_kwargs.get('missing_flags_dim', 4),)
+            # 如果無法獲取 init_kwargs，使用預設值
+            cli_output_shapes = {
+                'location': (7,),  # 預設 7 個類別
+                't_stage': (6,),   # 預設 6 個類別
+                'n_stage': (4,),   # 預設 4 個類別
+                'm_stage': (3,),   # 預設 3 個類別
+                'missing_flags': (4,)  # 預設 4 個標誌
             }
-            # 初始化臨床屬性 logits 字典，用於存儲第一次預測結果 (或平均結果)
-            for k, shape in attr_output_shapes.items():
-                predicted_logits_attrs[k] = torch.zeros(shape, dtype=torch.float32, device=results_device) # 使用 float32 保持精度
+            
+            # 如果有 attr_init_kwargs，從中獲取類別數量
+            if attr_init_kwargs:
+                cli_output_shapes = {
+                    'location': (attr_init_kwargs.get('num_location_classes', 7),),
+                    't_stage': (attr_init_kwargs.get('num_t_stage_classes', 6),),
+                    'n_stage': (attr_init_kwargs.get('num_n_stage_classes', 4),),
+                    'm_stage': (attr_init_kwargs.get('num_m_stage_classes', 3),),
+                    'missing_flags': (attr_init_kwargs.get('missing_flags_dim', 4),)
+                }
+            
+            # 初始化臨床屬性 logits 字典
+            for k, shape in cli_output_shapes.items():
+                predicted_logits_cli[k] = torch.zeros(shape, dtype=torch.float32, device=results_device) # 使用 float32 保持精度
 
             # 高斯加權設置
             if self.use_gaussian:
@@ -494,22 +710,22 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
             
             # 執行推論
             with tqdm(desc=None, total=len(slicers), disable=not self.allow_tqdm) as pbar:
-                first_attr_pred_processed = False # 標記是否已處理過臨床屬性預測
+                first_cli_pred_processed = False # 標記是否已處理過臨床屬性預測
                 while True:
                     item = queue.get() # 從隊列中獲取數據
                     if item == 'end': # 如果遇到結束標記
                         queue.task_done()
                         break
                     
-                    workon_image, workon_clinical_features, sl = item # 解包數據：影像切片、臨床特徵、切片器
+                    workon_image, workon_cli_features, sl = item # 解包數據：影像切片、臨床特徵、切片器
                     
                     # 執行預測，同時傳入影像和臨床特徵
                     # 返回的 prediction_seg 應為 (1, num_classes, D, H, W)
-                    # 返回的 attr_prediction 應為 {'location': (1, num_loc_classes), ...}
-                    prediction_seg_patch, attr_prediction_patch = self._internal_maybe_mirror_and_predict(
-                        workon_image, workon_clinical_features
+                    # 返回的 cli_prediction 應為 {'location': (1, num_loc_classes), ...}
+                    prediction_seg_patch, cli_prediction_patch = self._internal_maybe_mirror_and_predict(
+                        workon_image, workon_cli_features
                     )
-                    prediction_seg_patch = prediction_seg_patch.to(results_device) # 移除批次維度
+                    prediction_seg_patch = prediction_seg_patch.to(results_device) # 移到結果設備
 
                     # 移除 batch 維度
                     if isinstance(prediction_seg_patch, list):
@@ -517,88 +733,90 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
                     if prediction_seg_patch.shape[0] == 1:
                         prediction_seg_patch = prediction_seg_patch.squeeze(0)
 
-
                     # 應用高斯加權到分割結果
                     if self.use_gaussian:
                         prediction_seg_patch *= gaussian
                     
-                    # 檢查兩者的shape
-                    # print(f'predicted_logits[sl] shape: {predicted_logits_seg[sl].shape}, prediction shape: {prediction_seg_patch.shape}')
-                    # breakpoint()
-                    # predicted_logits[sl] shape: torch.Size([2, 112, 160, 128]), prediction shape: torch.Size([1, 2, 112, 160, 128])
-
                     # 累加分割結果和預測次數
                     predicted_logits_seg[sl] += prediction_seg_patch
                     n_predictions[sl[1:]] += gaussian
 
-                    # 處理臨床屬性結果：由於臨床特徵針對整個案例，其預測結果不應隨每個 patch 累加。
-                    # 我們只在第一次有效處理 patch 時記錄其臨床屬性預測，因為它代表了整個案例的預測。
-                    if not first_attr_pred_processed:
-                        for k, v in attr_prediction_patch.items():
-                            if predicted_logits_attrs[k] is not None:
-                                predicted_logits_attrs[k] = v.to(results_device) # 僅記錄第一個 patch 的結果 (移除批次維度)
-                        first_attr_pred_processed = True
+                    # 處理臨床屬性結果：採用基於前景比例的加權平均策略
+                    # 計算當前 patch 中的前景比例作為權重
+                    # 假設分割前景類別通常為 1+ (0 為背景)
+                    with torch.no_grad():
+                        # 取得預測的分割結果
+                        seg_pred = torch.argmax(prediction_seg_patch, dim=0)
+                        # 計算前景像素的比例
+                        foreground_ratio = (seg_pred > 0).float().mean().item()
+                        
+                        # 對於腫瘤預測，前景比例通常很小，需要提升權重的對比度
+                        # 使用輕微的非線性函數 (如 sqrt) 來增強小值的影響，同時避免極端權重
+                        weight = np.sqrt(foreground_ratio * 5) if foreground_ratio > 0 else 0.01
+                        
+                        # 防止極端值
+                        weight = min(max(weight, 0.01), 5.0)
+                        
+                        # 如果是首次處理，初始化累加器
+                        if not hasattr(self, 'cli_predictions_weighted_sum'):
+                            self.cli_predictions_weighted_sum = {k: None for k in predicted_logits_cli.keys()}
+                            self.foreground_weights_sum = 0
+                            # 額外跟踪各個臨床特徵的權重累加過程
+                            self.debug_weights = []
+                            
+                        # 記錄此次權重用於調試
+                        if hasattr(self, 'debug_weights'):
+                            self.debug_weights.append({
+                                'foreground_ratio': foreground_ratio,
+                                'weight': weight,
+                                'total_weight_so_far': self.foreground_weights_sum
+                            })
+                        
+                        # 加權累加臨床預測結果
+                        for k, v in cli_prediction_patch.items():
+                            if predicted_logits_cli[k] is not None and v is not None:
+                                v_device = v.to(results_device)
+                                # 移除批次維度如果有
+                                if v_device.dim() > 1 and v_device.shape[0] == 1:
+                                    v_device = v_device.squeeze(0)
+                                
+                                if self.cli_predictions_weighted_sum[k] is None:
+                                    self.cli_predictions_weighted_sum[k] = v_device * weight
+                                else:
+                                    self.cli_predictions_weighted_sum[k] += v_device * weight
+                        
+                        # 累加權重
+                        self.foreground_weights_sum += weight
                         
                     queue.task_done()
                     pbar.update() # 更新進度條
-
-            # # # 執行推論
-            # batch_size = 4
-            # with tqdm(desc=None, total=len(slicers), disable=not self.allow_tqdm) as pbar:
-            #     first_attr_pred_processed = False
-            #     patch_list, clinical_list, slice_list = [], [], []
-            #     while True:
-            #         item = queue.get()
-            #         if item == 'end':
-            #             # 處理最後不足 batch_size 的 patch
-            #             if patch_list:
-            #                 batch_tensor = torch.cat(patch_list, dim=0)
-            #                 batch_clinical = torch.cat(clinical_list, dim=0)
-            #                 seg_preds, attr_preds = self._internal_maybe_mirror_and_predict(batch_tensor, batch_clinical)
-            #                 for idx, sl in enumerate(slice_list):
-            #                     seg_patch = seg_preds[idx].to(results_device)
-            #                     if self.use_gaussian:
-            #                         seg_patch *= gaussian
-            #                     predicted_logits_seg[sl] += seg_patch
-            #                     n_predictions[sl[1:]] += gaussian
-            #                     if not first_attr_pred_processed:
-            #                         for k, v in attr_preds.items():
-            #                             if predicted_logits_attrs[k] is not None:
-            #                                 predicted_logits_attrs[k] = v[idx].to(results_device)
-            #                         first_attr_pred_processed = True
-            #                 pbar.update(len(patch_list))
-            #             queue.task_done()
-            #             break
-
-            #         workon_image, workon_clinical_features, sl = item
-            #         patch_list.append(workon_image)
-            #         clinical_list.append(workon_clinical_features)
-            #         slice_list.append(sl)
-
-            #         if len(patch_list) == batch_size:
-            #             batch_tensor = torch.cat(patch_list, dim=0)
-            #             batch_clinical = torch.cat(clinical_list, dim=0)
-            #             seg_preds, attr_preds = self._internal_maybe_mirror_and_predict(batch_tensor, batch_clinical)
-            #             for idx, sl in enumerate(slice_list):
-            #                 seg_patch = seg_preds[idx].to(results_device)
-            #                 if self.use_gaussian:
-            #                     seg_patch *= gaussian
-            #                 predicted_logits_seg[sl] += seg_patch
-            #                 n_predictions[sl[1:]] += gaussian
-            #                 if not first_attr_pred_processed:
-            #                     for k, v in attr_preds.items():
-            #                         if predicted_logits_attrs[k] is not None:
-            #                             predicted_logits_attrs[k] = v[idx].to(results_device)
-            #                     first_attr_pred_processed = True
-            #             patch_list, clinical_list, slice_list = [], [], []
-            #             pbar.update(batch_size) # 更新進度條
-            #         queue.task_done()
 
             queue.join() # 等待隊列處理完成
             
             # 計算分割結果的加權平均
             torch.div(predicted_logits_seg, n_predictions, out=predicted_logits_seg)
 
+            # 計算臨床預測的加權平均
+            if hasattr(self, 'cli_predictions_weighted_sum') and self.foreground_weights_sum > 0:
+                for k in predicted_logits_cli.keys():
+                    if self.cli_predictions_weighted_sum[k] is not None:
+                        predicted_logits_cli[k] = self.cli_predictions_weighted_sum[k] / self.foreground_weights_sum
+                
+                # 輸出調試信息
+                if self.verbose and hasattr(self, 'debug_weights'):
+                    print(f"臨床預測加權信息: 總權重={self.foreground_weights_sum:.4f}, 片段數={len(self.debug_weights)}")
+                    if len(self.debug_weights) > 0:
+                        max_weight = max(self.debug_weights, key=lambda x: x['weight'])
+                        min_weight = min(self.debug_weights, key=lambda x: x['weight'])
+                        print(f"  最大權重: {max_weight['weight']:.4f} (前景比例: {max_weight['foreground_ratio']:.4f})")
+                        print(f"  最小權重: {min_weight['weight']:.4f} (前景比例: {min_weight['foreground_ratio']:.4f})")
+                
+                # 清理，避免影響下一次調用
+                del self.cli_predictions_weighted_sum
+                del self.foreground_weights_sum
+                if hasattr(self, 'debug_weights'):
+                    del self.debug_weights
+            
             # 檢查分割預測結果中是否存在無窮值 (通常指示數值不穩定)
             if torch.any(torch.isinf(predicted_logits_seg)):
                 raise RuntimeError(
@@ -609,48 +827,61 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
         except Exception as e:
             # 異常時清理資源
             del predicted_logits_seg, n_predictions, prediction_seg, gaussian, workon_image
-            del predicted_logits_attrs
+            del predicted_logits_cli
+            # 清理加權平均的臨時變數
+            if hasattr(self, 'cli_predictions_weighted_sum'):
+                del self.cli_predictions_weighted_sum
+            if hasattr(self, 'foreground_weights_sum'):
+                del self.foreground_weights_sum
             empty_cache(self.device)
             empty_cache(results_device)
             raise e
         
         # 返回分割結果和臨床屬性結果
-        return predicted_logits_seg, predicted_logits_attrs
+        return predicted_logits_seg, predicted_logits_cli
 
     @torch.inference_mode()
-    def predict_sliding_window_return_logits(self, input_image: torch.Tensor, clinical_features: torch.Tensor) -> Tuple[torch.Tensor, dict]:
+    def predict_sliding_window_return_logits(self, data: torch.Tensor, loc: torch.Tensor, t: torch.Tensor, n: torch.Tensor, m: torch.Tensor):
         """
-        滑動窗口預測主入口，返回分割 logits 和臨床屬性 logits。
-        此方法會處理影像的填充、滑窗切片，並將影像和臨床特徵傳遞給底層模型進行預測。
+        使用滑動窗口方法進行預測，返回原始 logits（用於驗證）。
+        支持多模態數據輸入（影像 + 臨床特徵）。
         
         Args:
-            input_image (torch.Tensor): 原始輸入影像 (4D 張量，(批次, 通道, D, H, W))。
-            clinical_features (torch.Tensor): 該案例的臨床特徵數據 (2D 張量，(批次, prompt_dim))。
+            data (torch.Tensor): 影像數據，形狀為 [C, X, Y, Z]
+            loc (torch.Tensor): 腫瘤位置特徵，形狀為 [1]
+            t (torch.Tensor): T 分期特徵，形狀為 [1]
+            n (torch.Tensor): N 分期特徵，形狀為 [1]
+            m (torch.Tensor): M 分期特徵，形狀為 [1]
             
         Returns:
-            Tuple[torch.Tensor, dict]: 包含分割 logits 和臨床屬性 logits 字典的元組。
+            Tuple[torch.Tensor, dict]: 分割預測 logits 和臨床屬性預測 logits
         """
-        assert isinstance(input_image, torch.Tensor), "輸入影像必須是 torch.Tensor 類型。"
-        assert isinstance(clinical_features, torch.Tensor), "輸入臨床特徵必須是 torch.Tensor 類型。"
-
+        # 將臨床特徵組織成字典
+        clinical_features = {
+            'location': loc.unsqueeze(0) if loc.dim() == 0 else loc,
+            't_stage': t.unsqueeze(0) if t.dim() == 0 else t,
+            'n_stage': n.unsqueeze(0) if n.dim() == 0 else n,
+            'm_stage': m.unsqueeze(0) if m.dim() == 0 else m
+        }
+        
+        assert isinstance(data, torch.Tensor), "輸入影像必須是 torch.Tensor 類型。"
+    
         self.network = self.network.to(self.device) # 確保網路在正確設備
         self.network.eval() # 設定為評估模式
         empty_cache(self.device) # 清理設備緩存
 
         # 自動混合精度設置（僅 CUDA 設備）
         with torch.autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
-            assert input_image.ndim == 4, '輸入影像必須是4D張量（批次, 通道, x, y, z）。'
-            # 臨床特徵假定為 (批次, prompt_dim)
+            assert data.ndim == 4, '輸入影像必須是4D張量（通道, x, y, z）。'
 
             if self.verbose:
-                print(f'輸入影像形狀: {input_image.shape}')
-                print(f'輸入臨床特徵形狀: {clinical_features.shape}')
+                print(f'輸入影像形狀: {data.shape}')
                 print(f"步長: {self.tile_step_size}")
                 print(f"鏡像軸: {self.allowed_mirroring_axes if self.use_mirroring else '無'}")
 
             # 邊界填充處理：當影像尺寸小於 patch_size 時，需要對影像進行填充
-            data_padded, slicer_revert_padding = pad_nd_image(
-                input_image,
+            padded_data, slicer_revert_padding = pad_nd_image(
+                data, 
                 self.configuration_manager.patch_size, # 目標尺寸 (patch_size)
                 'constant', # 填充類型為常數
                 {'value': 0}, # 填充值為 0
@@ -658,142 +889,73 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
                 None # 無需指定邊框
             )
 
-            # 獲取滑動窗口切片器：這些切片器定義了每個 patch 的位置
-            slicers = self._internal_get_sliding_window_slicers(data_padded.shape[1:])
+            # 對於缺失的臨床特徵，使用 missing_flags 的值進行填充
+            # 首先嘗試從編碼器中取得缺失標記，如果沒有則使用預設值
+            missing_loc = 6  # 預設缺失值索引
+            missing_t = 5
+            missing_n = 3
+            missing_m = 2
+            
+            if hasattr(self, 'missing_flags') and self.missing_flags is not None:
+                missing_loc = self.missing_flags.get('location', missing_loc)
+                missing_t = self.missing_flags.get('t_stage', missing_t)
+                missing_n = self.missing_flags.get('n_stage', missing_n)
+                missing_m = self.missing_flags.get('m_stage', missing_m)
+            
+            # 檢查臨床特徵是否存在
+            if 'location' not in clinical_features or clinical_features['location'] is None:
+                clinical_features['location'] = torch.tensor([[missing_loc]], device=self.device)
+            if 't_stage' not in clinical_features or clinical_features['t_stage'] is None:
+                clinical_features['t_stage'] = torch.tensor([[missing_t]], device=self.device)
+            if 'n_stage' not in clinical_features or clinical_features['n_stage'] is None:
+                clinical_features['n_stage'] = torch.tensor([[missing_n]], device=self.device)
+            if 'm_stage' not in clinical_features or clinical_features['m_stage'] is None:
+                clinical_features['m_stage'] = torch.tensor([[missing_m]], device=self.device)
+            
+            # 記錄哪些特徵是缺失的（用於後續的 missing_flags 處理）
+            is_loc_missing = clinical_features['location'].item() == missing_loc if clinical_features['location'].numel() == 1 else False
+            is_t_missing = clinical_features['t_stage'].item() == missing_t if clinical_features['t_stage'].numel() == 1 else False
+            is_n_missing = clinical_features['n_stage'].item() == missing_n if clinical_features['n_stage'].numel() == 1 else False
+            is_m_missing = clinical_features['m_stage'].item() == missing_m if clinical_features['m_stage'].numel() == 1 else False
+            
+            # 打印調試信息
+            if self.verbose:
+                print(f"臨床特徵: loc={clinical_features['location'].item()}, t={clinical_features['t_stage'].item()}, n={clinical_features['n_stage'].item()}, m={clinical_features['m_stage'].item()}")
+                print(f"缺失標記: loc={is_loc_missing}, t={is_t_missing}, n={is_n_missing}, m={is_m_missing}")
 
-            # 執行預測：嘗試在設備上執行所有操作，如果記憶體不足則回退到 CPU
-            if self.perform_everything_on_device and self.device.type == 'cuda':
-                try:
-                    predicted_logits_seg, predicted_logits_attrs = self._internal_predict_sliding_window_return_logits(
-                        data_padded, clinical_features, slicers, self.perform_everything_on_device
-                    )
-                except RuntimeError: # 通常因記憶體不足 (OOM) 引起
-                    print('設備預測失敗（可能因內存不足），將結果數組移至CPU')
-                    empty_cache(self.device) # 清理 GPU 緩存
-                    predicted_logits_seg, predicted_logits_attrs = self._internal_predict_sliding_window_return_logits(
-                        data_padded, clinical_features, slicers, False # 在 CPU 上執行
-                    )
-            else:
-                # 不在設備上執行或設備為 CPU/MPS
-                predicted_logits_seg, predicted_logits_attrs = self._internal_predict_sliding_window_return_logits(
-                    data_padded, clinical_features, slicers, self.perform_everything_on_device
+            # 確保所有特徵都在正確的設備上
+            for k in clinical_features.keys():
+                clinical_features[k] = clinical_features[k].to(self.device)
+
+            # 獲取滑動窗口切片器：這些切片器定義了每個 patch 的位置
+            slicers = self._internal_get_sliding_window_slicers(padded_data.shape[1:])
+
+            # 執行預測
+            try:
+                predicted_seg_logits, predicted_cli_logits = self._internal_predict_sliding_window_return_logits(
+                    padded_data, clinical_features, slicers, self.perform_everything_on_device
                 )
+            except RuntimeError:
+                print('在設備上預測失敗，可能是由於記憶體不足。將結果數組移至 CPU')
+                empty_cache(self.device)
+                predicted_seg_logits, predicted_cli_logits = self._internal_predict_sliding_window_return_logits(
+                    padded_data, clinical_features, slicers, False
+                )
+
+            # 移除填充區域：將分割 logits 恢復到原始影像尺寸
+            predicted_seg_logits = predicted_seg_logits[(slice(None), *slicer_revert_padding[1:])]
 
             empty_cache(self.device) # 清理設備緩存
 
-            # 移除填充區域：將分割 logits 恢復到原始影像尺寸
-            predicted_logits_seg = predicted_logits_seg[(slice(None), *slicer_revert_padding[1:])]
-
-            # 返回分割 logits 和臨床屬性 logits
-            return predicted_logits_seg, predicted_logits_attrs
-
-    # def predict_single_npy_array(self,
-    #                              input_image: np.ndarray,
-    #                              image_properties: dict,
-    #                              segmentation_previous_stage: np.ndarray = None,
-    #                              clinical_features: np.ndarray = None, # 新增臨床特徵
-    #                              output_file_truncated: str = None,
-    #                              save_or_return_probabilities: bool = False):
-    #     """
-    #     警告：速度較慢！僅在無法批量處理時使用此方法。
-    #     此方法適用於對單個 NumPy 陣列進行預測，現在也接受臨床特徵。
-    #     它會手動處理影像的預處理和預測流程。
-        
-    #     Args:
-    #         input_image (np.ndarray): 輸入影像的 NumPy 陣列。
-    #         image_properties (dict): 影像的屬性字典。
-    #         segmentation_previous_stage (np.ndarray, optional): 前一階段的分割結果 (用於級聯模型)。
-    #         clinical_features (np.ndarray, optional): 該案例的臨床特徵 NumPy 陣列。
-    #         output_file_truncated (str, optional): 輸出文件的路徑前綴 (不含擴展名)。
-    #         save_or_return_probabilities (bool): 是否保存或返回分割的機率圖。
-            
-    #     Returns:
-    #         Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]: 根據 `save_or_return_probabilities` 返回分割圖或分割圖和機率圖。
-    #         對於多模態，額外返回臨床屬性 logits 字典。
-    #     """
-    #     # 手動執行預處理邏輯 (簡化，僅為示例)
-    #     # 影像數據從 NumPy 陣列轉換為 Torch 張量
-    #     input_image_tensor = torch.from_numpy(input_image).float()
-        
-    #     # 臨床特徵從 NumPy 陣列轉換為 Torch 張量
-    #     clinical_features_tensor = None
-    #     if clinical_features is not None:
-    #         clinical_features_tensor = torch.from_numpy(clinical_features).float()
-    #         # 確保 clinical_features_tensor 有批次維度，例如 (1, prompt_dim)
-    #         if clinical_features_tensor.ndim == 1:
-    #             clinical_features_tensor = clinical_features_tensor[None] # 添加批次維度
-    #     else:
-    #         # 如果沒有臨床資料 (例如 Stage 1 數據)，創建一個填充零的張量
-    #         # 這裡需要從 configuration_manager 獲取 MyModel 的 prompt_dim
-    #         # 注意：這裡的 self.configuration_manager.network_arch_init_kwargs 是 Trainer 初始化時設定的
-    #         # 而在 Predictor 中，network_arch_init_kwargs 可能不包含 MyModel 的所有自訂參數
-    #         # 穩健做法是從 self.network (或其 module/orig_mod) 中獲取 MyModel 的 prompt_dim
-    #         # 為簡潔起見，這裡硬編碼為 17 (MyModel 預設值)
-    #         prompt_dim = self.network.init_kwargs.get('prompt_dim', 14) if not isinstance(self.network, (nn.parallel.DistributedDataParallel, OptimizedModule)) \
-    #             else (self.network.module.init_kwargs.get('prompt_dim', 14) if isinstance(self.network, DistributedDataParallel) else self.network._orig_mod.init_kwargs.get('prompt_dim', 14))
-    #         clinical_features_tensor = torch.zeros((1, prompt_dim), dtype=torch.float32)
-
-    #     if self.verbose:
-    #         print('正在進行預測')
-        
-    #     # 呼叫修改後的 predict_logits_and_attributes_from_preprocessed_data
-    #     # 它將返回分割 logits 和臨床屬性 logits
-    #     predicted_logits_seg, predicted_logits_attrs = self.predict_logits_and_attributes_from_preprocessed_data(
-    #         input_image_tensor, clinical_features_tensor
-    #     )
-    #     predicted_logits_seg = predicted_logits_seg.cpu() # 將分割結果移動到 CPU
-
-    #     if self.verbose:
-    #         print('重採樣到原始形狀')
-
-    #     # 處理輸出：保存文件或直接返回結果
-    #     if output_file_truncated is not None:
-    #         # export_prediction_from_logits 處理分割結果的保存
-    #         export_prediction_from_logits(
-    #             predicted_logits_seg,
-    #             image_properties,
-    #             self.configuration_manager,
-    #             self.plans_manager,
-    #             self.dataset_json,
-    #             output_file_truncated,
-    #             save_or_return_probabilities
-    #         )
-    #         # 臨床屬性結果不保存為文件，但可以在這裡選擇返回
-    #         return {
-    #             'segmentation_file': output_file_truncated + self.dataset_json['file_ending'],
-    #             'clinical_attributes_logits': predicted_logits_attrs # 返回臨床屬性 logits (Torch 張量)
-    #         }
-    #     else:
-    #         # convert_predicted_logits_to_segmentation_with_correct_shape 處理分割結果的返回
-    #         segmentation_result, probabilities_result = convert_predicted_logits_to_segmentation_with_correct_shape(
-    #             predicted_logits_seg,
-    #             self.plans_manager,
-    #             self.configuration_manager,
-    #             self.label_manager,
-    #             image_properties,
-    #             return_probabilities=save_or_return_probabilities
-    #         )
-
-    #         # 根據 save_or_return_probabilities 返回不同的元組
-    #         if save_or_return_probabilities:
-    #             return segmentation_result, probabilities_result, predicted_logits_attrs
-    #         else:
-    #             return segmentation_result, predicted_logits_attrs
-
-# 如果需要從命令行直接調用此模組進行預測，可以擴展 predict_entry_point 等函數
-# 這裡為簡潔起見，不提供命令行入口點的完整修改，因為它通常在 nnunetv2_predict 腳本中處理。
+            return predicted_seg_logits, predicted_cli_logits
 
 
-# ------------------------------------------------
-    # 1. 內部 iterator 統一換成多模態版本
-    # ------------------------------------------------
     def _internal_get_data_iterator_from_lists_of_filenames(
         self,
         input_list_of_lists: List[List[str]],
         seg_from_prev_stage_files: Union[List[str], None],
         output_filenames_truncated: Union[List[str], None],
-        num_processes: int,
-        clinical_data_folder: Union[str, None] = None  # 新增
+        num_processes: int
     ):
         """改用多模態 iterator"""
         return preprocessing_iterator_fromfiles_multimodal(
@@ -806,12 +968,9 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
             num_processes,
             self.device.type == 'cuda',
             self.verbose_preprocessing,
-            clinical_data_folder=clinical_data_folder
+            clinical_data_dir=self.clinical_data_dir
         )
 
-    # ------------------------------------------------
-    # 2. predict_from_files 加上 clinical_data_folder
-    # ------------------------------------------------
     def predict_from_files(
         self,
         list_of_lists_or_source_folder: Union[str, List[List[str]]],
@@ -822,8 +981,7 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
         num_processes_segmentation_export: int = 3,
         folder_with_segs_from_prev_stage: str = None,
         num_parts: int = 1,
-        part_id: int = 0,
-        clinical_data_folder: Union[str, None] = None  # 新增
+        part_id: int = 0
     ):
         """
         執行流程:
@@ -831,6 +989,47 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
             再呼叫 _internal_get_data_iterator_from_lists_of_filenames 建立 data_iterator
             最後呼叫 self.predict_from_data_iterator(...)
         """
+
+        # 檢查 id 是否超出範圍
+        assert part_id <= num_parts, ("Part ID must be smaller than num_parts. Remember that we start counting with 0. "
+                                      "So if there are 3 parts then valid part IDs are 0, 1, 2")
+        
+        # 檢查輸入類型
+        # 如果是字串，則視為資料夾；
+        if isinstance(output_folder_or_list_of_truncated_output_files, str):
+            output_folder = output_folder_or_list_of_truncated_output_files
+        # 如果是列表，則代表輸入的是 numpy 陣列的輸出檔名
+        elif isinstance(output_folder_or_list_of_truncated_output_files, list):
+            output_folder = os.path.dirname(output_folder_or_list_of_truncated_output_files[0])
+        else:
+            output_folder = None
+
+        # cascade 模型使用 (用不到)
+        if self.configuration_manager.previous_stage_name is not None:
+            assert folder_with_segs_from_prev_stage is not None, \
+                f'The requested configuration is a cascaded network. It requires the segmentations of the previous ' \
+                f'stage ({self.configuration_manager.previous_stage_name}) as input. Please provide the folder where' \
+                f' they are located via folder_with_segs_from_prev_stage'
+
+
+        # 把推論參數(my_init_kwargs), dataset.json, plan,json 存到 output_folder
+        ########################
+        # let's store the input arguments so that its clear what was used to generate the prediction
+        if output_folder is not None:
+            my_init_kwargs = {}
+            for k in inspect.signature(self.predict_from_files).parameters.keys():
+                my_init_kwargs[k] = locals()[k]
+            my_init_kwargs = deepcopy(
+                my_init_kwargs)  # let's not unintentionally change anything in-place. Take this as a
+            recursive_fix_for_json_export(my_init_kwargs)
+            maybe_mkdir_p(output_folder)
+            save_json(my_init_kwargs, join(output_folder, 'predict_from_raw_data_args.json'))
+
+            # we need these two if we want to do things with the predictions like for example apply postprocessing
+            save_json(self.dataset_json, join(output_folder, 'dataset.json'), sort_keys=False)
+            save_json(self.plans_manager.plans, join(output_folder, 'plans.json'), sort_keys=False)
+        #######################
+
         # 1. 整理輸入/輸出清單（直接沿用父類邏輯）
         list_of_lists, output_filenames, seg_prev_files = self._manage_input_and_output_lists(
             list_of_lists_or_source_folder,
@@ -850,8 +1049,7 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
             list_of_lists,
             seg_prev_files,
             output_filenames,
-            num_processes_preprocessing,
-            clinical_data_folder=clinical_data_folder
+            num_processes_preprocessing
         )
 
         # 3. 交給 predict_from_data_iterator 完成推論
@@ -861,136 +1059,7 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
             num_processes_segmentation_export
         )
 
-    # ------------------------------------------------
-    # 3. 順序版 predict_from_files_sequential
-    # ------------------------------------------------
-    def predict_from_files_sequential(
-        self,
-        list_of_lists_or_source_folder: Union[str, List[List[str]]],
-        output_folder_or_list_of_truncated_output_files: Union[str, None, List[str]],
-        save_probabilities: bool = False,
-        overwrite: bool = True,
-        folder_with_segs_from_prev_stage: str = None,
-        clinical_data_folder: Union[str, None] = None  # 新增
-    ):
-        """
-        單線程版本：同樣支援 clinical_data_folder
-        """
-        # 1. 整理清單（固定 part_id=0, num_parts=1）
-        list_of_lists, output_filenames, seg_prev_files = self._manage_input_and_output_lists(
-            list_of_lists_or_source_folder,
-            output_folder_or_list_of_truncated_output_files,
-            folder_with_segs_from_prev_stage,
-            overwrite,
-            0, 1, save_probabilities
-        )
-        if len(list_of_lists) == 0:
-            print('無需處理新案例，跳過')
-            return []
-
-        # 2. 建立 iterator（單線程）
-        iterator = preprocessing_iterator_fromfiles_multimodal(
-            list_of_lists,
-            seg_prev_files,
-            output_filenames,
-            self.plans_manager,
-            self.dataset_json,
-            self.configuration_manager,
-            num_processes=1,
-            pin_memory=False,
-            verbose=self.verbose,
-            clinical_data_folder=clinical_data_folder
-        )
-
-        # 3. 推論
-        return self.predict_from_data_iterator(iterator, save_probabilities, 1)
-
-    # ------------------------------------------------
-    # 4. predict_from_list_of_npy_arrays 增加臨床資料
-    # ------------------------------------------------
-    def predict_from_list_of_npy_arrays(
-        self,
-        image_or_list_of_images: Union[np.ndarray, List[np.ndarray]],
-        segs_from_prev_stage_or_list_of_segs_from_prev_stage: Union[None, np.ndarray, List[np.ndarray]],
-        properties_or_list_of_properties: Union[dict, List[dict]],
-        truncated_ofname: Union[str, List[str], None],
-        num_processes: int = 3,
-        save_probabilities: bool = False,
-        num_processes_segmentation_export: int = 3,
-        clinical_data_folder: Union[str, None] = None  # 新增
-    ):
-        """
-        直接從 numpy 陣列推論，支援臨床資料
-        """
-        # 1. 統一變成 list 格式
-        images = [image_or_list_of_images] if not isinstance(image_or_list_of_images, list) else image_or_list_of_images
-        segs = [segs_from_prev_stage_or_list_of_segs_from_prev_stage] if isinstance(segs_from_prev_stage_or_list_of_segs_from_prev_stage, np.ndarray) else segs_from_prev_stage_or_list_of_segs_from_prev_stage
-        props = [properties_or_list_of_properties] if isinstance(properties_or_list_of_properties, dict) else properties_or_list_of_properties
-        ofnames = [truncated_ofname] if isinstance(truncated_ofname, str) else truncated_ofname
-
-        # 2. 建立 iterator（從 numpy）
-        iterator = preprocessing_iterator_fromfiles_multimodal(
-            images,  # 雖然叫 fromfiles，但內部其實支援 numpy list
-            segs,
-            ofnames,
-            self.plans_manager,
-            self.dataset_json,
-            self.configuration_manager,
-            num_processes,
-            self.device.type == 'cuda',
-            self.verbose_preprocessing,
-            clinical_data_folder=clinical_data_folder
-        )
-
-        # 3. 推論
-        return self.predict_from_data_iterator(
-            iterator,
-            save_probabilities,
-            num_processes_segmentation_export
-        )
-
-    # ------------------------------------------------
-    # 5. predict_single_npy_array 也補上臨床資料
-    # ------------------------------------------------
-    def predict_single_npy_array(
-        self,
-        input_image: np.ndarray,
-        image_properties: dict,
-        segmentation_previous_stage: np.ndarray = None,
-        clinical_features: np.ndarray = None,   # 直接給 numpy 陣列
-        output_file_truncated: str = None,
-        save_or_return_probabilities: bool = False
-    ):
-        """
-        單張 numpy 推論：把單筆資料包成 list 後交給上一個方法
-        注意：此處 clinical_features 直接給 numpy，不從硬碟讀
-        """
-        # 1. 把單張包成 list
-        images = [input_image]
-        segs = [segmentation_previous_stage]
-        props = [image_properties]
-        ofnames = [output_file_truncated]
-
-        # 2. 建立 iterator（num_processes=1）
-        iterator = preprocessing_iterator_fromfiles_multimodal(
-            images,
-            segs,
-            ofnames,
-            self.plans_manager,
-            self.dataset_json,
-            self.configuration_manager,
-            num_processes=1,
-            pin_memory=False,
-            verbose=self.verbose,
-            clinical_data_folder=None  # 不從資料夾讀，直接給 numpy
-        )
-
-        # 3. 推論
-        results = self.predict_from_data_iterator(iterator, save_or_return_probabilities, 1)
-
-        # 4. 回傳單筆結果
-        return results[0] if results else None
-        
+    # ----------------------------------
     # 訓練最後的驗證不會用到 真的推論時才會用到
     def initialize_from_trained_model_folder(
         self,
@@ -1000,7 +1069,7 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
     ):
         """
         從訓練好的模型目錄初始化多模態預測器。
-        與父類唯一差別：讀取額外維度 prompt_dim 並建立 MyModel。
+        與父類唯一差別：讀取額外維度 prompt_dim 並建立 MyMultiModel。
         """
         # 0. 自動偵測折數（與父類相同）
         if use_folds is None:
@@ -1029,14 +1098,7 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
                 inference_allowed_mirroring_axes = checkpoint.get(
                     'inference_allowed_mirroring_axes', None
                 )
-                # ★★ 讀取 prompt_dim 等額外參數 ★★
-                extra_kwargs = checkpoint.get('init_kwargs', {})
-                prompt_dim = extra_kwargs.get('prompt_dim', 14)
-                location_classes = extra_kwargs.get('location_classes', 7)
-                t_stage_classes = extra_kwargs.get('t_stage_classes', 6)
-                n_stage_classes = extra_kwargs.get('n_stage_classes', 4)
-                m_stage_classes = extra_kwargs.get('m_stage_classes', 3)
-                missing_flags_dim = extra_kwargs.get('missing_flags_dim', 4)
+
             parameters.append(checkpoint['network_weights'])
 
         # 3. 建立計劃與配置管理器
@@ -1045,52 +1107,30 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
             plans_manager, configuration_manager, dataset_json
         )
 
-        # 4. 動態載入訓練器並建立網路
+        # 4. 動態載入trainer並建立網路
         trainer_class = recursive_find_python_class(
             join(nnunetv2.__path__[0], "training", "nnUNetTrainer"),
             trainer_name,
             'nnunetv2.training.nnUNetTrainer'
         )
+        print(f"載入訓練器類別: {trainer_name}")
         if trainer_class is None:
             raise RuntimeError(f'找不到訓練器類別 {trainer_name}')
 
-        # my_model_init_kwargs = {
-        #     'input_channels': self.num_input_channels,
-        #     'num_classes': self.label_manager.num_segmentation_heads,
-        #     'deep_supervision': self.enable_deep_supervision,
-        #     'prompt_dim': 17,
-        #     'location_classes': 7,
-        #     't_stage_classes': 6,
-        #     'n_stage_classes': 4,
-        #     'm_stage_classes': 3,
-        #     'missing_flags_dim': 4
-        # }
+        # 建立模型
         my_model_init_kwargs = {
             'input_channels': num_input_channels_img,
             'num_classes': plans_manager.get_label_manager(dataset_json).num_segmentation_heads,
             'deep_supervision': False,
-            'prompt_dim': prompt_dim,
-            'location_classes': location_classes,
-            't_stage_classes': t_stage_classes,
-            'n_stage_classes': n_stage_classes,
-            'm_stage_classes': m_stage_classes,
-            'missing_flags_dim': missing_flags_dim
+            'clinical_csv_dir': self.clinical_data_dir
         }
-        network = trainer_class.build_network_architecture(MyModel, my_model_init_kwargs).to(self.device)
+        
+        # 打印模型初始化參數
+        print(f"模型初始化參數: {my_model_init_kwargs}")
+        
+        network = trainer_class.build_network_architecture(MyMultiModel, my_model_init_kwargs).to(self.device)
 
-        # 5. 建立 MyModel 並載入權重
-        model = MyModel(
-            input_channels=num_input_channels_img,
-            num_classes=plans_manager.get_label_manager(dataset_json).num_segmentation_heads,
-            deep_supervision=False,
-            prompt_dim=prompt_dim,
-            location_classes=location_classes,
-            t_stage_classes=t_stage_classes,
-            n_stage_classes=n_stage_classes,
-            m_stage_classes=m_stage_classes,
-            missing_flags_dim=missing_flags_dim
-        )
-
+        # 加載網絡權重
         network.load_state_dict(parameters[0])
         self.network = network
 
@@ -1110,21 +1150,29 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
             print('啟用 torch.compile 加速')
             self.network = torch.compile(self.network)
 
-
+    # 直接 super 原生 predictor 方法 (沒改)
     def _manage_input_and_output_lists(
         self,
         list_of_lists_or_source_folder: Union[str, List[List[str]]],
         output_folder_or_list_of_truncated_output_files: Union[str, None, List[str]],
         folder_with_segs_from_prev_stage: str = None,
-        overwrite: bool = True,
-        part_id: int = 0,
-        num_parts: int = 1,
+        overwrite: bool = True,  # 是否覆蓋已存在的檔案 (如果 false，則只保留不存在的檔案索引)
+        part_id: int = 0,        # 目前是第幾張 GPU
+        num_parts: int = 1,      # 總共幾張 GPU
         save_probabilities: bool = False,
     ) -> Tuple[List[List[str]], List[str], List[str]]:
         """
-        與父類同名，唯一差別：計算「總輸入通道數」時加入臨床 prompt 維度。
+        統一格式:
+        Args:
+        - list_of_lists_or_source_folder: 可能是"輸入"資料夾路徑或影像檔案清單
+        - output_folder_or_list_of_truncated_output_files: 同樣可能是"輸出"資料夾或輸出檔案清單
+        - folder_with_segs_from_prev_stage: 前階段分割檔案資料夾
+
+        returns:
+        - list_of_lists: 整理後的影像路徑清單
+        - output_filenames: 整理後的輸出檔名清單
+        - seg_prev_files: 整理後的前階段分割檔案清單
         """
-        # 1. 先呼叫父類完成所有檔案列表整理
         list_of_lists, output_filenames, seg_prev_files = super()._manage_input_and_output_lists(
             list_of_lists_or_source_folder,
             output_folder_or_list_of_truncated_output_files,
@@ -1135,95 +1183,11 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
             save_probabilities,
         )
 
-        # 2. 重新計算總輸入通道數（影像 + seg-prev one-hot + prompt）
-        num_img_channels = determine_num_input_channels(
-            self.plans_manager, self.configuration_manager, self.dataset_json
-        )
-        num_seg_prev_channels = 0
-        if folder_with_segs_from_prev_stage is not None:
-            num_seg_prev_channels = len(
-                self.label_manager.foreground_labels
-            )  # one-hot 後的通道數
-        prompt_dim = getattr(self.network, 'prompt_dim', 17)  # 從模型抓維度
-        total_input_channels = num_img_channels + num_seg_prev_channels + prompt_dim
-
-        # 3. 印出供確認
-        if self.verbose:
-            print(
-                f"[多模態] 影像通道={num_img_channels}, "
-                f"前階段分割通道={num_seg_prev_channels}, "
-                f"臨床 prompt 維度={prompt_dim}, "
-                f"總輸入通道={total_input_channels}"
-            )
-
         return list_of_lists, output_filenames, seg_prev_files
-
-
-    # 覆蓋父類同名方法
-    def predict_single_npy_array(
-        self,
-        input_image: np.ndarray,
-        image_properties: dict,
-        segmentation_previous_stage: np.ndarray = None,
-        clinical_features: np.ndarray = None,
-        output_file_truncated: str = None,
-        save_or_return_probabilities: bool = False,
-    ):
-        """
-        單張 numpy 推論：直接把臨床 prompt 一起傳給推論函數
-        """
-        # 1. 轉 tensor
-        image_tensor = torch.from_numpy(input_image).float()
-        prompt_dim = getattr(self.network, 'prompt_dim', 17)
-        if clinical_features is None:
-            clinical_tensor = torch.zeros((1, prompt_dim), dtype=torch.float32)
-        else:
-            clinical_tensor = torch.from_numpy(clinical_features).float()
-            if clinical_tensor.ndim == 1:
-                clinical_tensor = clinical_tensor.unsqueeze(0)  # 加 batch
-
-        # 2. 推論
-        seg_logits, attr_logits = self.predict_logits_and_attributes_from_preprocessed_data(
-            image_tensor, clinical_tensor
-        )
-        seg_logits = seg_logits.cpu()
-
-        # 3. 後處理
-        if output_file_truncated is not None:
-            export_prediction_from_logits(
-                seg_logits,
-                image_properties,
-                self.configuration_manager,
-                self.plans_manager,
-                self.dataset_json,
-                output_file_truncated,
-                save_or_return_probabilities,
-            )
-            return {
-                'segmentation_file': output_file_truncated + self.dataset_json['file_ending'],
-                'clinical_attributes_logits': attr_logits,
-            }
-        else:
-            seg, prob = convert_predicted_logits_to_segmentation_with_correct_shape(
-                seg_logits,
-                self.plans_manager,
-                self.configuration_manager,
-                self.label_manager,
-                image_properties,
-                return_probabilities=save_or_return_probabilities,
-            )
-            if save_or_return_probabilities:
-                return seg, prob, attr_logits
-            else:
-                return seg, attr_logits
-        
-
 
 import argparse
 import torch
 import os
-import cProfile
-import pstats
 
 import argparse
 import torch
@@ -1255,7 +1219,8 @@ def predict_entry_point_multimodal():
     parser.add_argument('-part_id', type=int, required=False, default=0, help='當前分片ID')
     parser.add_argument('-device', type=str, default='cuda', required=False, help="推論設備: 'cuda', 'cpu', 'mps'")
     parser.add_argument('--disable_progress_bar', action='store_true', default=False, help='停用進度條')
-    parser.add_argument('--clinical_data_folder', type=str, required=False, default=None, help='臨床資料資料夾 (pkl)')
+    parser.add_argument("--clinical_data_dir", type=str, default=None,
+                        help="包含臨床數據的目錄路徑")
 
     print(
         "\n#######################################################################\n"
@@ -1297,7 +1262,8 @@ def predict_entry_point_multimodal():
         device=device,
         verbose=False,
         allow_tqdm=not args.disable_progress_bar,
-        verbose_preprocessing=False
+        verbose_preprocessing=False,
+        clinical_data_dir=args.clinical_data_dir
     )
 
     predictor.initialize_from_trained_model_folder(
@@ -1305,10 +1271,6 @@ def predict_entry_point_multimodal():
         args.f,
         checkpoint_name=args.chk
     )
-
-    # 進行效能測試
-    # profiler = cProfile.Profile()
-    # profiler.enable()
 
     # 執行推論
     predictor.predict_from_files(
@@ -1320,84 +1282,5 @@ def predict_entry_point_multimodal():
         num_processes_segmentation_export=args.nps,
         folder_with_segs_from_prev_stage=args.prev_stage_predictions,
         num_parts=args.num_parts,
-        part_id=args.part_id,
-        clinical_data_folder=args.clinical_data_folder
+        part_id=args.part_id
     )
-
-    # profiler.disable()
-    # stats = pstats.Stats(profiler).sort_stats('cumtime')
-    # stats.print_stats(20)  # 印出前20個最耗時的函數
-
-
-    # # 進行效能測試
-    # # 我們將使用 torch.profiler 代替 cProfile
-    # with torch.profiler.profile(
-    #     activities=[
-    #         torch.profiler.ProfilerActivity.CPU,
-    #         torch.profiler.ProfilerActivity.CUDA,  # 如果使用 GPU
-    #     ],
-    #     schedule=torch.profiler.schedule(
-    #         wait=1,  # 前1個 step 不分析 (例如第一次迭代的數據加載)
-    #         warmup=0,  # 接下來1個 step 作為預熱 (讓 CUDA 內核達到穩定狀態)
-    #         active=2,  # 接下來3個 step 進行分析 (分析3次核心預測)
-    #         repeat=0   # 重複一次這個循環 (總共分析 3*2 = 6 次)
-    #     ),
-    #     on_trace_ready=torch.profiler.tensorboard_trace_handler("./log"),  # 輸出到 ./log 目錄，可用 TensorBoard 查看
-    #     record_shapes=True,       # 記錄張量形狀
-    #     profile_memory=True,      # 分析內存使用 (較耗資源)
-    #     with_stack=True,          # 記錄 Python 堆疊 (用於追溯調用來源)
-    #     with_flops=True           # 計算浮點運算次數 (FLOPs)
-    # ) as prof:
-        
-    #     # 執行推論，並將 profiler 對象傳遞給 predict_from_files
-    #     # 注意：我們需要修改 predict_from_files 來接受 profiler，但為了不修改太多，
-    #     # 我們直接調用 predict_from_data_iterator，因為我們已經修改了它。
-    #     # 但為了保持與您原始代碼的相似性，我們可以這樣做：
-        
-    #     # 1. 使用 predict_from_files 的邏輯創建 list_of_lists 等
-    #     list_of_lists, output_filenames, seg_prev_files = predictor._manage_input_and_output_lists(
-    #         args.i,
-    #         args.o,
-    #         args.prev_stage_predictions,
-    #         overwrite=not args.continue_prediction,
-    #         part_id=args.part_id,
-    #         num_parts=args.num_parts
-    #     )
-        
-    #     if len(list_of_lists) == 0:
-    #         print(f'進程 {args.part_id}/{args.num_parts} 無需處理新案例，跳過')
-    #         return []
-
-    #     # 2. 創建 data_iterator
-    #     data_iterator = predictor._internal_get_data_iterator_from_lists_of_filenames(
-    #         list_of_lists,
-    #         seg_prev_files,
-    #         output_filenames,
-    #         num_processes=args.npp,
-    #         clinical_data_folder=args.clinical_data_folder
-    #     )
-
-    #     # 3. 直接調用 predict_from_data_iterator 並傳入 profiler
-    #     predictor.predict_from_data_iterator(
-    #         data_iterator,
-    #         save_probabilities=args.save_probabilities,
-    #         num_processes_segmentation_export=args.nps,
-    #         profiler=prof  # 關鍵：傳遞 profiler
-    #     )
-
-    # # 分析結束，輸出結果
-    # print("\n" + "="*80)
-    # print("效能分析結果 (按 CUDA 時間排序):")
-    # print("="*80)
-    # print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
-
-    # print("\n" + "="*80)
-    # print("效能分析結果 (按 CPU 時間排序):")
-    # print("="*80)
-    # print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=10))
-
-    # print("\n效能分析完成。TensorBoard 追蹤已保存到 ./log 目錄。")
-
-    # # 如果您想完全保持原始代碼，可以將 profiler 傳遞給一個修改版的 predict_from_files，
-    # # 但這需要修改 predict_from_files，這與修改 predict_from_data_iterator 的工作量相似。
-    # # 因此，上述方法是最佳平衡點。

@@ -163,45 +163,65 @@ class nnUNetPredictor(object):
         print(f'found the following folds: {use_folds}')
         return use_folds
 
-    def _manage_input_and_output_lists(self, list_of_lists_or_source_folder: Union[str, List[List[str]]],
-                                       output_folder_or_list_of_truncated_output_files: Union[None, str, List[str]],
-                                       folder_with_segs_from_prev_stage: str = None,
-                                       overwrite: bool = True,
-                                       part_id: int = 0,
-                                       num_parts: int = 1,
-                                       save_probabilities: bool = False):
+    def _manage_input_and_output_lists(self, 
+                                   list_of_lists_or_source_folder: Union[str, List[List[str]]],
+                                   output_folder_or_list_of_truncated_output_files: Union[None, str, List[str]],
+                                   folder_with_segs_from_prev_stage: str = None,
+                                   overwrite: bool = True,
+                                   part_id: int = 0,
+                                   num_parts: int = 1,
+                                   save_probabilities: bool = False):
+        # 1. 如果輸入是資料夾路徑（str），則自動解析成每個案例的檔案路徑清單
         if isinstance(list_of_lists_or_source_folder, str):
-            list_of_lists_or_source_folder = create_lists_from_splitted_dataset_folder(list_of_lists_or_source_folder,
-                                                                                       self.dataset_json['file_ending'])
-        print(f'There are {len(list_of_lists_or_source_folder)} cases in the source folder')
-        list_of_lists_or_source_folder = list_of_lists_or_source_folder[part_id::num_parts]
-        caseids = [os.path.basename(i[0])[:-(len(self.dataset_json['file_ending']) + 5)] for i in
-                   list_of_lists_or_source_folder]
-        print(
-            f'I am processing {part_id} out of {num_parts} (max process ID is {num_parts - 1}, we start counting with 0!)')
-        print(f'There are {len(caseids)} cases that I would like to predict')
+            list_of_lists_or_source_folder = create_lists_from_splitted_dataset_folder(
+                list_of_lists_or_source_folder,
+                self.dataset_json['file_ending']
+            )
+        print(f'共有 {len(list_of_lists_or_source_folder)} 個案例在來源資料夾中')
 
+        # 2. 根據分片設定（多 GPU/多進程），只保留當前分片要處理的案例
+        #    例如 num_parts=3, part_id=1，則只取第 1/3 片
+        list_of_lists_or_source_folder = list_of_lists_or_source_folder[part_id::num_parts]
+
+        # 3. 解析每個案例的識別碼（caseids），通常是檔名去除副檔名
+        caseids = [os.path.basename(i[0])[:-(len(self.dataset_json['file_ending']) + 5)] 
+                for i in list_of_lists_or_source_folder]
+        print(f'目前處理分片 {part_id}/{num_parts}（最大分片ID為 {num_parts - 1}，從 0 開始計算）')
+        print(f'本次預測共 {len(caseids)} 個案例')
+
+        # 4. 根據 output_folder 或 output_file list，建立每個案例的輸出檔名（不含副檔名）
         if isinstance(output_folder_or_list_of_truncated_output_files, str):
             output_filename_truncated = [join(output_folder_or_list_of_truncated_output_files, i) for i in caseids]
         elif isinstance(output_folder_or_list_of_truncated_output_files, list):
             output_filename_truncated = output_folder_or_list_of_truncated_output_files[part_id::num_parts]
         else:
             output_filename_truncated = None
-        seg_from_prev_stage_files = [join(folder_with_segs_from_prev_stage, i + self.dataset_json['file_ending']) if
-                                     folder_with_segs_from_prev_stage is not None else None for i in caseids]
-        # remove already predicted files from the lists
+
+        # 5. 如果有前階段分割結果資料夾，則建立每個案例的前階段分割檔案路徑
+        seg_from_prev_stage_files = [
+            join(folder_with_segs_from_prev_stage, i + self.dataset_json['file_ending']) 
+            if folder_with_segs_from_prev_stage is not None else None 
+            for i in caseids
+        ]
+
+        # 6. 若 overwrite=False，則只保留尚未預測過的案例（已存在的檔案會被跳過）
         if not overwrite and output_filename_truncated is not None:
+            # 檢查分割檔案是否已存在
             tmp = [isfile(i + self.dataset_json['file_ending']) for i in output_filename_truncated]
+            # 如果要儲存機率圖，則也要檢查 .npz 檔案是否存在
             if save_probabilities:
                 tmp2 = [isfile(i + '.npz') for i in output_filename_truncated]
                 tmp = [i and j for i, j in zip(tmp, tmp2)]
+            # 只保留尚未預測的案例索引
             not_existing_indices = [i for i, j in enumerate(tmp) if not j]
 
+            # 根據索引過濾所有清單
             output_filename_truncated = [output_filename_truncated[i] for i in not_existing_indices]
             list_of_lists_or_source_folder = [list_of_lists_or_source_folder[i] for i in not_existing_indices]
             seg_from_prev_stage_files = [seg_from_prev_stage_files[i] for i in not_existing_indices]
-            print(f'overwrite was set to {overwrite}, so I am only working on cases that haven\'t been predicted yet. '
-                  f'That\'s {len(not_existing_indices)} cases.')
+            print(f'overwrite 設定為 {overwrite}，只處理尚未預測的案例，共 {len(not_existing_indices)} 個案例。')
+
+        # 7. 回傳三個清單：影像路徑清單、輸出檔名清單、前階段分割檔案清單
         return list_of_lists_or_source_folder, output_filename_truncated, seg_from_prev_stage_files
 
     def predict_from_files(self,

@@ -416,10 +416,8 @@ class MyMultiModel(nn.Module):
             'm_stage':  m_out    # m_out[0] = [B, C=2]
         }
 
-        if self.deep_supervision:
-            return seg_out, cli_out
-        else:
-            return seg_out[0], cli_out[0]
+        # 如果關閉深度監督 只返回最後一層的輸出 (已經在前面設定 不用在這裡判斷是否啟用)
+        return seg_out, cli_out
         
 
 if __name__ == "__main__":
