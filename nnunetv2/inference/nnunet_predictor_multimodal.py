@@ -52,7 +52,8 @@ from nnunetv2.training.nnUNetTrainer.multitask_model import MyMultiModel
 
 import csv
 from nnunetv2.preprocessing.clinical_data_label_encoder import ClinicalDataLabelEncoder
-
+import time
+import json
 
 class nnUNetPredictorMultimodal(nnUNetPredictor):
     """
@@ -65,10 +66,10 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
                  use_mirroring: bool = True,  # 是否使用測試時數據增強（鏡像）
                  perform_everything_on_device: bool = True, # 是否全程在 GPU 執行
                  device: torch.device = torch.device('cuda'), # 指定運算設備
-                 verbose: bool = False,       # 是否輸出詳細日誌
+                 verbose: bool = True,       # 是否輸出詳細日誌
                  verbose_preprocessing: bool = False, # 是否輸出預處理詳細日誌
-                 allow_tqdm: bool = True,
-                 clinical_data_dir: Optional[str] = None):    # 是否允許顯示進度條
+                 allow_tqdm: bool = True,     # 是否允許顯示進度條
+                 clinical_data_dir: str = None):
         super().__init__(tile_step_size, use_gaussian, use_mirroring,
                          perform_everything_on_device, device, verbose,
                          verbose_preprocessing, allow_tqdm)
@@ -86,12 +87,47 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
         self.reverse_m_stage_mapping = None
 
     # 初始化臨床資料編碼器 取得反向 mapping
-    # 初始化臨床資料編碼器 取得反向 mapping
     def initialize_clinical_encoder(self):
         """初始化臨床數據編碼器並設置反向映射"""
+        debug_log_path = "/mnt/data1/graduate/yuxin/Lab/model/UNet_base/nnunet_ins_data/nnunet_debug.txt"
+        
+        # 寫入debug信息到文件
+        def write_debug_log(message):
+            try:
+                with open(debug_log_path, "a") as f:
+                    f.write(f"{message}\n")
+            except Exception as e:
+                print(f"無法寫入debug日誌: {e}")
+                
         if self.clinical_data_dir:
             try:
+                import pandas as pd
+                import traceback
+                
+                write_debug_log(f"[PREDICTOR] 正在初始化臨床數據編碼器，目錄: {self.clinical_data_dir}")
+                
                 self.clinical_data_label_encoder = ClinicalDataLabelEncoder(self.clinical_data_dir)
+                self.num_clinical_classes = {
+                    'location': self.clinical_data_label_encoder.num_location_classes,
+                    't_stage': self.clinical_data_label_encoder.num_t_stage_classes,
+                    'n_stage': self.clinical_data_label_encoder.num_n_stage_classes,
+                    'm_stage': self.clinical_data_label_encoder.num_m_stage_classes
+                }
+                
+                # 記錄缺失標記的索引
+                self.missing_flags = {
+                    'location': self.clinical_data_label_encoder.missing_flag_location,
+                    't_stage': self.clinical_data_label_encoder.missing_flag_t_stage,
+                    'n_stage': self.clinical_data_label_encoder.missing_flag_n_stage,
+                    'm_stage': self.clinical_data_label_encoder.missing_flag_m_stage
+                }
+                
+                # 保存反向映射以供檢視結果使用
+                self.reverse_location_mapping = self.clinical_data_label_encoder.reverse_location_mapping
+                self.reverse_t_stage_mapping = self.clinical_data_label_encoder.reverse_t_stage_mapping
+                self.reverse_n_stage_mapping = self.clinical_data_label_encoder.reverse_n_stage_mapping
+                self.reverse_m_stage_mapping = self.clinical_data_label_encoder.reverse_m_stage_mapping
+                
                 # 從編碼器獲取反向映射
                 self.reverse_mappings = {
                     'location': self.clinical_data_label_encoder.reverse_location_mapping,
@@ -99,46 +135,54 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
                     'n_stage': self.clinical_data_label_encoder.reverse_n_stage_mapping,
                     'm_stage': self.clinical_data_label_encoder.reverse_m_stage_mapping
                 }
-                # 從編碼器獲取缺失標記
-                self.missing_flags = {
-                    'location': self.clinical_data_label_encoder.missing_flag_location,
-                    't_stage': self.clinical_data_label_encoder.missing_flag_t_stage,
-                    'n_stage': self.clinical_data_label_encoder.missing_flag_n_stage,
-                    'm_stage': self.clinical_data_label_encoder.missing_flag_m_stage
-                }
+                
+                # 檢查是否成功載入臨床數據
+                if hasattr(self.clinical_data_label_encoder, 'clinical_encoded_df'):
+                    df = self.clinical_data_label_encoder.clinical_encoded_df
+                    write_debug_log(f"[PREDICTOR] 成功載入臨床數據 CSV，共 {len(df)} 行")
+                    write_debug_log(f"[PREDICTOR] 臨床數據表頭: {df.columns.tolist()}")
+                    write_debug_log(f"[PREDICTOR] 臨床數據案例ID範例: {df['Case_Index'].tolist()[:5]}")
+                    
+                    print(f"已載入臨床數據CSV，形狀: {df.shape}，列: {df.columns.tolist()}")
+                    print(f"包含 {len(df['Case_Index'].unique())} 個唯一案例ID")
+                else:
+                    write_debug_log("[PREDICTOR警告] clinical_data_label_encoder 沒有 clinical_encoded_df 屬性")
+                
+                write_debug_log("[PREDICTOR] 臨床數據編碼器初始化成功")
                 print(f"臨床數據編碼器初始化成功，缺失標記: {self.missing_flags}")
+                
             except Exception as e:
                 print(f"[警告] 無法初始化 ClinicalDataLabelEncoder: {e}")
+                write_debug_log(f"[PREDICTOR錯誤] 初始化臨床數據編碼器時發生錯誤: {e}")
+                write_debug_log(traceback.format_exc())
+                traceback.print_exc()
                 self.clinical_data_label_encoder = None
                 self.reverse_mappings = None
                 self.missing_flags = None
 
-
+    # 推論主函式
     @torch.inference_mode()
     def predict_from_data_iterator(self,
                                 data_iterator,
-                                save_probabilities: bool = False,
-                                num_processes_segmentation_export: int = default_num_processes,
-                                profiler=None): # 新增可選參數
+                                save_probabilities: bool = False, # 是否儲存預測的機率圖。
+                                num_processes_segmentation_export: int = default_num_processes, # 用於分割結果導出的進程數。
+                                profiler=None): # 是否啟用於性能分析(功能未完成 別用)
         """
-        從數據迭代器進行預測（核心預測引擎），支援多模態數據。
-        每個迭代器返回的元素必須是包含 'data'、'ofile' 和 'data_properties' 鍵的字典。
-        其中 'data' 是一個字典，包含 'data' (影像張量)、'clinical_features' (臨床特徵張量)。
-        如果 'ofile' 為 None，結果將直接返回而不是寫入文件。
-
-        Args:
-            data_iterator: 產生預處理後數據的迭代器，每個元素應為字典
-                `{'data': {'data': image_tensor, 'clinical_features': clinical_tensor, 'has_clinical_data': bool_tensor}, 'ofile': ..., 'data_properties': ...}`
-            save_probabilities (bool): 是否儲存預測的機率圖。
-            num_processes_segmentation_export (int): 用於分割結果導出的進程數。
-            profiler (torch.profiler.Profiler): 可選的 PyTorch 分析器對象，用於性能分析。
-
-        Returns:
-            list: 預測結果列表。
+        對 iterator 提供的資料 進行推論
+        迭代器返回的內容為
+        item = {
+                'data': data,  # 影像數據
+                'target': seg,  # 分割標籤
+                'clinical_data': clinical_data,  # 臨床數據字典
+                'clinical_mask': clinical_mask,  # 臨床掩碼字典
+                'properties': data_properties,  # 數據屬性
+                'ofile': output_filenames_truncated[idx] if output_filenames_truncated is not None else None  # 輸出文件路徑
+            }
         """
         # 初始化臨床數據編碼器
         if self.clinical_data_dir:
             self.initialize_clinical_encoder()
+
         # 將臨床資料的預測結果 進行 argmax 接著轉換為實際標籤
         def clinical_logits_to_labels(clinical_attr_preds):
             # 使用反向映射將索引轉回標籤
@@ -172,10 +216,10 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
                     m_uncertain = np.max(m_probs) < 0.7
                     
                     # 記錄原始索引和缺失值標記
-                    loc_missing_idx = self.missing_flags.get('location', 6)
-                    t_missing_idx = self.missing_flags.get('t_stage', 5)
-                    n_missing_idx = self.missing_flags.get('n_stage', 3)
-                    m_missing_idx = self.missing_flags.get('m_stage', 2)
+                    loc_missing_idx = self.missing_flags.get('location')
+                    t_missing_idx = self.missing_flags.get('t_stage')
+                    n_missing_idx = self.missing_flags.get('n_stage')
+                    m_missing_idx = self.missing_flags.get('m_stage')
                     
                     # 如果 missing_flag 為 True 或特徵索引等於缺失值索引，則標記為 "Missing"
                     loc_label = "Missing" if (missing_flags[0] or loc_idx == loc_missing_idx) else self.reverse_mappings['location'].get(loc_idx, 'Unknown')
@@ -238,6 +282,17 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
                     if k != "Case_Index":  # 跳過案例ID，因為它是從文件名中生成的
                         f.write(f"{k}: {v}\n")
 
+        # 將 numpy bool 轉換為原生 bool，以便 JSON 序列化
+        def convert_numpy_bool(obj):
+            if isinstance(obj, dict):
+                return {k: convert_numpy_bool(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [convert_numpy_bool(v) for v in obj]
+            elif isinstance(obj, np.bool_):
+                return bool(obj)
+            else:
+                return obj
+
         # 保存臨床預測結果 csv
         def save_clinical_prediction_csv(csv_path, all_clinical_results):
             if not all_clinical_results:
@@ -286,17 +341,29 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
                 for row in cleaned_results:
                     writer.writerow(row)
                     
+
             # 另外保存一個調試信息版本（如果存在）
             if 'Debug_Info' in all_clinical_results[0]:
                 debug_csv_path = csv_path.replace('.csv', '_debug.json')
-                import json
+                cleaned_debug_results = [convert_numpy_bool(r) for r in all_clinical_results]
                 with open(debug_csv_path, 'w') as f:
-                    json.dump(all_clinical_results, f, indent=4)
+                    json.dump(cleaned_debug_results, f, indent=4)
                 print(f"診斷資訊已保存到: {debug_csv_path}")
 
         # 從這邊開始 才比較類似原生的程式
         # 使用 'spawn' 上下文創建進程池，以避免 CUDA 相關問題
         all_clinical_results = []
+
+        # # !!!!!!!!!!!!   打開以後 會等所有iterator處理完 GPU才開始推論  超慢 !!!!!!!!!!!!
+        # # DEBUG: 檢查 iterator 內容與長度
+        # data_list = list(data_iterator)
+        # print(f"[DEBUG] iterator 資料總數: {len(data_list)}")
+        # for idx, item in enumerate(data_list):
+        #     case_id = item.get('ofile', None) or (item.get('properties', {}).get('case_identifier', None) if 'properties' in item else None)
+        #     print(f"[DEBUG] iterator 第{idx+1}筆: ofile={case_id}")
+        # # 重新用 list 迭代
+        # data_iterator = iter(data_list)
+
         with multiprocessing.get_context("spawn").Pool(num_processes_segmentation_export) as export_pool:
             worker_list = [i for i in export_pool._pool] # 獲取工作進程列表
             r = [] # 用於儲存異步操作的結果物件
@@ -304,10 +371,6 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
             # 遍歷預處理後的數據
             print("開始處理預處理後的數據...")
             for i, preprocessed_item in enumerate(data_iterator):
-            # [DEBUG]  只推論前三筆檔案!!!!!
-            #     if i >= 3:  # 只處理前兩個
-            #         break
-
                 # --- 性能分析：在每次處理一個案例前，調用 prof.step() ---
                 # 注意：profiler.step() 的調用會根據 schedule 來決定是否記錄。
                 if profiler is not None:
@@ -337,6 +400,8 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
                 ofile = preprocessed_item['ofile']  # 輸出文件名 (如果存在)
                 properties = preprocessed_item['properties']  # 原始影像屬性
 
+                # 紀錄時間
+                print("當前時間:", time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()))
                 if ofile is not None:
                     print(f'\n正在預測 {os.path.basename(ofile)}:')
                 else:
@@ -346,7 +411,7 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
                 # 流量控制：避免 GPU 預測過快導致導出進程阻塞
                 proceed = not check_workers_alive_and_busy(export_pool, worker_list, r, allowed_num_queued=4)
                 while not proceed:
-                    sleep(0.05) # 等待 50 毫秒
+                    sleep(0.1) # 等待 100 毫秒
                     proceed = not check_workers_alive_and_busy(export_pool, worker_list, r, allowed_num_queued=4)
                 
                 # 呼叫修改後的預測邏輯，同時傳入影像數據和臨床特徵
@@ -451,7 +516,8 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
         }
 
     @torch.inference_mode()
-    def predict_logits_and_attributes_from_preprocessed_data(self, data: torch.Tensor, clinical_features: dict) -> Tuple[torch.Tensor, dict]:
+    def predict_logits_and_attributes_from_preprocessed_data(self, data: torch.Tensor, 
+                                                             clinical_features: dict) -> Tuple[torch.Tensor, dict]:
         """
         重要！如果是級聯模型，前階段分割必須已以 one-hot 編碼形式堆疊在影像頂部！
         此方法同時返回分割的 logits 和臨床屬性預測的 logits。
@@ -471,7 +537,7 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
         # 初始化臨床屬性預測的累加器
         prediction_cli = {k: None for k in ['location', 't_stage', 'n_stage', 'm_stage', 'missing_flags']}
 
-        # 模型集成：遍歷所有參數集（多折交叉驗證）
+        # ensemble 用， list_of_parameters 其實是 list of 模型權重 (長度為 fold 數量)
         for params in self.list_of_parameters:
             # 加載模型參數
             if not isinstance(self.network, OptimizedModule):
@@ -498,7 +564,7 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
                 for k, v in cli_logits_single_model.items():
                     prediction_cli[k] += v.to('cpu')
         
-        # 計算平均預測 (如果有多個模型)
+        # 將多個 fold 計算的結果 進行平均
         if len(self.list_of_parameters) > 1:
             prediction_seg /= len(self.list_of_parameters)
             for k in prediction_cli.keys():
@@ -672,10 +738,10 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
 
             # 如果無法獲取 init_kwargs，使用預設值
             cli_output_shapes = {
-                'location': (7,),  # 預設 7 個類別
-                't_stage': (6,),   # 預設 6 個類別
-                'n_stage': (4,),   # 預設 4 個類別
-                'm_stage': (3,),   # 預設 3 個類別
+                'location': (self.num_clinical_classes['location'],),  # 預設 7 個類別
+                't_stage': (self.num_clinical_classes['t_stage'],),   # 預設 6 個類別
+                'n_stage': (self.num_clinical_classes['n_stage'],),   # 預設 4 個類別
+                'm_stage': (self.num_clinical_classes['m_stage'],),   # 預設 3 個類別
                 'missing_flags': (4,)  # 預設 4 個標誌
             }
             
@@ -690,6 +756,7 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
                 }
             
             # 初始化臨床屬性 logits 字典
+            predicted_logits_cli = {}
             for k, shape in cli_output_shapes.items():
                 predicted_logits_cli[k] = torch.zeros(shape, dtype=torch.float32, device=results_device) # 使用 float32 保持精度
 
@@ -708,9 +775,8 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
             if not self.allow_tqdm and self.verbose:
                 print(f'運行預測: {len(slicers)} 步')
             
-            # 執行推論
+            # 使用 tqdm 進度條
             with tqdm(desc=None, total=len(slicers), disable=not self.allow_tqdm) as pbar:
-                first_cli_pred_processed = False # 標記是否已處理過臨床屬性預測
                 while True:
                     item = queue.get() # 從隊列中獲取數據
                     if item == 'end': # 如果遇到結束標記
@@ -719,7 +785,7 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
                     
                     workon_image, workon_cli_features, sl = item # 解包數據：影像切片、臨床特徵、切片器
                     
-                    # 執行預測，同時傳入影像和臨床特徵
+                    # 真正使用鏡像增強預測
                     # 返回的 prediction_seg 應為 (1, num_classes, D, H, W)
                     # 返回的 cli_prediction 應為 {'location': (1, num_loc_classes), ...}
                     prediction_seg_patch, cli_prediction_patch = self._internal_maybe_mirror_and_predict(
@@ -741,7 +807,7 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
                     predicted_logits_seg[sl] += prediction_seg_patch
                     n_predictions[sl[1:]] += gaussian
 
-                    # 處理臨床屬性結果：採用基於前景比例的加權平均策略
+                    # --------處理臨床屬性結果：採用基於前景比例的加權平均策略--------
                     # 計算當前 patch 中的前景比例作為權重
                     # 假設分割前景類別通常為 1+ (0 為背景)
                     with torch.no_grad():
@@ -754,7 +820,7 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
                         # 使用輕微的非線性函數 (如 sqrt) 來增強小值的影響，同時避免極端權重
                         weight = np.sqrt(foreground_ratio * 5) if foreground_ratio > 0 else 0.01
                         
-                        # 防止極端值
+                        # 防止極端值 (權重最大值為 5.0，最小值為 0.01)
                         weight = min(max(weight, 0.01), 5.0)
                         
                         # 如果是首次處理，初始化累加器
@@ -764,7 +830,7 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
                             # 額外跟踪各個臨床特徵的權重累加過程
                             self.debug_weights = []
                             
-                        # 記錄此次權重用於調試
+                        # 記錄此次patch的前景比例,權重,目前累積的權重用於調試
                         if hasattr(self, 'debug_weights'):
                             self.debug_weights.append({
                                 'foreground_ratio': foreground_ratio,
@@ -773,19 +839,21 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
                             })
                         
                         # 加權累加臨床預測結果
-                        for k, v in cli_prediction_patch.items():
+                        for k, v in cli_prediction_patch.items(): # cli_prediction_patch 是一個字典，v遍歷所有特徵預測Logits
                             if predicted_logits_cli[k] is not None and v is not None:
                                 v_device = v.to(results_device)
-                                # 移除批次維度如果有
+                                # 如果有 batch 維度，則移除
                                 if v_device.dim() > 1 and v_device.shape[0] == 1:
                                     v_device = v_device.squeeze(0)
                                 
+                                # 如果是首次處理，初始化累加器
                                 if self.cli_predictions_weighted_sum[k] is None:
-                                    self.cli_predictions_weighted_sum[k] = v_device * weight
+                                    # 將預測出來的 logits * 當前 patch 的權重
+                                    self.cli_predictions_weighted_sum[k] = v_device * weight 
                                 else:
                                     self.cli_predictions_weighted_sum[k] += v_device * weight
                         
-                        # 累加權重
+                        # 紀錄目前權重累積了多少
                         self.foreground_weights_sum += weight
                         
                     queue.task_done()
@@ -793,7 +861,7 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
 
             queue.join() # 等待隊列處理完成
             
-            # 計算分割結果的加權平均
+            # 計算分割結果的加權平均 ( patch 會有重疊 所以會計算每個 voxel 被預測了幾次 下去取平均)
             torch.div(predicted_logits_seg, n_predictions, out=predicted_logits_seg)
 
             # 計算臨床預測的加權平均
@@ -888,36 +956,23 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
                 True, # 返回切片器用於恢復原始尺寸
                 None # 無需指定邊框
             )
-
-            # 對於缺失的臨床特徵，使用 missing_flags 的值進行填充
-            # 首先嘗試從編碼器中取得缺失標記，如果沒有則使用預設值
-            missing_loc = 6  # 預設缺失值索引
-            missing_t = 5
-            missing_n = 3
-            missing_m = 2
             
-            if hasattr(self, 'missing_flags') and self.missing_flags is not None:
-                missing_loc = self.missing_flags.get('location', missing_loc)
-                missing_t = self.missing_flags.get('t_stage', missing_t)
-                missing_n = self.missing_flags.get('n_stage', missing_n)
-                missing_m = self.missing_flags.get('m_stage', missing_m)
-            
-            # 檢查臨床特徵是否存在
+            # 如果特徵不存在或為 None，則使用預設的缺失值填充
             if 'location' not in clinical_features or clinical_features['location'] is None:
-                clinical_features['location'] = torch.tensor([[missing_loc]], device=self.device)
+                clinical_features['location'] = torch.tensor([[self.missing_flags['location']]], device=self.device)
             if 't_stage' not in clinical_features or clinical_features['t_stage'] is None:
-                clinical_features['t_stage'] = torch.tensor([[missing_t]], device=self.device)
+                clinical_features['t_stage'] = torch.tensor([[self.missing_flags['t_stage']]], device=self.device)
             if 'n_stage' not in clinical_features or clinical_features['n_stage'] is None:
-                clinical_features['n_stage'] = torch.tensor([[missing_n]], device=self.device)
+                clinical_features['n_stage'] = torch.tensor([[self.missing_flags['n_stage']]], device=self.device)
             if 'm_stage' not in clinical_features or clinical_features['m_stage'] is None:
-                clinical_features['m_stage'] = torch.tensor([[missing_m]], device=self.device)
-            
+                clinical_features['m_stage'] = torch.tensor([[self.missing_flags['m_stage']]], device=self.device)
+
             # 記錄哪些特徵是缺失的（用於後續的 missing_flags 處理）
-            is_loc_missing = clinical_features['location'].item() == missing_loc if clinical_features['location'].numel() == 1 else False
-            is_t_missing = clinical_features['t_stage'].item() == missing_t if clinical_features['t_stage'].numel() == 1 else False
-            is_n_missing = clinical_features['n_stage'].item() == missing_n if clinical_features['n_stage'].numel() == 1 else False
-            is_m_missing = clinical_features['m_stage'].item() == missing_m if clinical_features['m_stage'].numel() == 1 else False
-            
+            is_loc_missing = clinical_features['location'].item() == self.missing_flags['location'] if clinical_features['location'].numel() == 1 else False
+            is_t_missing = clinical_features['t_stage'].item() == self.missing_flags['t_stage'] if clinical_features['t_stage'].numel() == 1 else False
+            is_n_missing = clinical_features['n_stage'].item() == self.missing_flags['n_stage'] if clinical_features['n_stage'].numel() == 1 else False
+            is_m_missing = clinical_features['m_stage'].item() == self.missing_flags['m_stage'] if clinical_features['m_stage'].numel() == 1 else False
+
             # 打印調試信息
             if self.verbose:
                 print(f"臨床特徵: loc={clinical_features['location'].item()}, t={clinical_features['t_stage'].item()}, n={clinical_features['n_stage'].item()}, m={clinical_features['m_stage'].item()}")
@@ -927,7 +982,9 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
             for k in clinical_features.keys():
                 clinical_features[k] = clinical_features[k].to(self.device)
 
-            # 獲取滑動窗口切片器：這些切片器定義了每個 patch 的位置
+            # 獲取滑動窗口的範圍列表
+            # 回傳的是 切片範圍的列表 [patch1, patch2 ...]
+            # 每個 patch 裡面類似是 [(x起點,x終點), (y起點,y終點), (z起點,z終點)] 實際更複雜)
             slicers = self._internal_get_sliding_window_slicers(padded_data.shape[1:])
 
             # 執行預測
@@ -981,7 +1038,8 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
         num_processes_segmentation_export: int = 3,
         folder_with_segs_from_prev_stage: str = None,
         num_parts: int = 1,
-        part_id: int = 0
+        part_id: int = 0,
+        max_cases: int = None  # 新增參數：限制處理的案例數量
     ):
         """
         執行流程:
@@ -1040,6 +1098,15 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
             num_parts,
             save_probabilities
         )
+        
+        # 如果設置了 max_cases，限制處理的案例數量
+        if max_cases is not None and max_cases > 0:
+            print(f"限制處理案例數為 {max_cases} (原有 {len(list_of_lists)} 個案例)")
+            list_of_lists = list_of_lists[:max_cases]
+            if output_filenames is not None:
+                output_filenames = output_filenames[:max_cases]
+            if seg_prev_files is not None:
+                seg_prev_files = seg_prev_files[:max_cases]
         if len(list_of_lists) == 0:
             print(f'進程 {part_id}/{num_parts} 無需處理新案例，跳過')
             return []
@@ -1085,7 +1152,8 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
         if isinstance(use_folds, str):
             use_folds = [use_folds]
 
-        parameters = []
+        # ensemble 用
+        parameters = [] # 保存總共有哪些 fold
         for i, f in enumerate(use_folds):
             f = int(f) if f != 'all' else f
             checkpoint = torch.load(
@@ -1137,7 +1205,7 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
         # 6. 儲存其餘必要屬性
         self.plans_manager = plans_manager
         self.configuration_manager = configuration_manager
-        self.list_of_parameters = parameters
+        self.list_of_parameters = parameters # ensemble 用 紀錄總共有幾個 fold 的模型權重
         self.dataset_json = dataset_json
         self.trainer_name = trainer_name
         self.allowed_mirroring_axes = inference_allowed_mirroring_axes
@@ -1221,6 +1289,10 @@ def predict_entry_point_multimodal():
     parser.add_argument('--disable_progress_bar', action='store_true', default=False, help='停用進度條')
     parser.add_argument("--clinical_data_dir", type=str, default=None,
                         help="包含臨床數據的目錄路徑")
+    parser.add_argument('--verbose', action='store_true', default=False, help='啟用詳細輸出')
+    parser.add_argument('--max_cases', type=int, required=False, default=None, 
+                        help='限制處理的案例數量（用於測試或調試）')
+
 
     print(
         "\n#######################################################################\n"
@@ -1260,9 +1332,9 @@ def predict_entry_point_multimodal():
         use_mirroring=not args.disable_tta,
         perform_everything_on_device=True,
         device=device,
-        verbose=False,
+        verbose=args.verbose,
+        verbose_preprocessing=args.verbose,
         allow_tqdm=not args.disable_progress_bar,
-        verbose_preprocessing=False,
         clinical_data_dir=args.clinical_data_dir
     )
 
@@ -1282,5 +1354,6 @@ def predict_entry_point_multimodal():
         num_processes_segmentation_export=args.nps,
         folder_with_segs_from_prev_stage=args.prev_stage_predictions,
         num_parts=args.num_parts,
-        part_id=args.part_id
+        part_id=args.part_id,
+        max_cases=args.max_cases
     )

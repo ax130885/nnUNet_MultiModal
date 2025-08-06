@@ -65,6 +65,41 @@ class ClinicalDataLabelEncoder:
         self.reverse_t_stage_mapping = {v: k for k, v in self.t_stage_mapping.items()}
         self.reverse_n_stage_mapping = {v: k for k, v in self.n_stage_mapping.items()}
         self.reverse_m_stage_mapping = {v: k for k, v in self.m_stage_mapping.items()}
+        
+        # 檢查編碼後的CSV文件是否存在，如果不存在則創建
+        if not isfile(self.output_csv_path):
+            print(f"未找到編碼後的CSV文件，正在創建: {self.output_csv_path}")
+            self.clinical_encoded_df = self.forward()
+        else:
+            print(f"找到編碼後的CSV文件: {self.output_csv_path}")
+            # 讀取已編碼的CSV文件作為參考
+            self.clinical_encoded_df = pd.read_csv(self.output_csv_path)
+            print(f"已載入編碼後的臨床數據，形狀為: {self.clinical_encoded_df.shape}")
+            
+            # 檢查是否有缺失值
+            if 'Case_Index' in self.clinical_encoded_df.columns:
+                case_count = len(self.clinical_encoded_df['Case_Index'].unique())
+                print(f"臨床數據包含 {case_count} 個唯一案例")
+            else:
+                print("警告: CSV文件中沒有Case_Index列")
+                
+        # 確保 Case_Index 列存在
+        if 'Case_Index' not in self.clinical_encoded_df.columns and 'ID' in self.clinical_encoded_df.columns:
+            # 如果沒有 Case_Index 但有 ID 列，則使用 ID 作為 Case_Index
+            self.clinical_encoded_df['Case_Index'] = self.clinical_encoded_df['ID']
+            print("使用 ID 列作為 Case_Index")
+            
+        # 如果有 location/t_stage/n_stage/m_stage 列但沒有小寫的對應列，則添加小寫列
+        if 'Location' in self.clinical_encoded_df.columns and 'location' not in self.clinical_encoded_df.columns:
+            self.clinical_encoded_df['location'] = self.clinical_encoded_df['Location']
+        if 'T_stage' in self.clinical_encoded_df.columns and 't_stage' not in self.clinical_encoded_df.columns:
+            self.clinical_encoded_df['t_stage'] = self.clinical_encoded_df['T_stage']
+        if 'N_stage' in self.clinical_encoded_df.columns and 'n_stage' not in self.clinical_encoded_df.columns:
+            self.clinical_encoded_df['n_stage'] = self.clinical_encoded_df['N_stage']
+        if 'M_stage' in self.clinical_encoded_df.columns and 'm_stage' not in self.clinical_encoded_df.columns:
+            self.clinical_encoded_df['m_stage'] = self.clinical_encoded_df['M_stage']
+            
+        print(f"已載入臨床數據，可用欄位: {self.clinical_encoded_df.columns.tolist()}")
 
     # 進行標籤編碼
     def forward(self) -> pd.DataFrame:
@@ -91,10 +126,20 @@ class ClinicalDataLabelEncoder:
                 raise ValueError(f"{name} 特徵當中出現: {unknown_values}，不在映射表當中。請檢查原始資料。")
 
         # 根據 init 設定的對照表進行 label encoding 
+        df['location'] = df['Location'].map(self.location_mapping)
+        df['t_stage'] = df['T_stage'].map(self.t_stage_mapping)
+        df['n_stage'] = df['N_stage'].map(self.n_stage_mapping)
+        df['m_stage'] = df['M_stage'].map(self.m_stage_mapping)
+        
+        # 保留原始大寫列
         df['Location'] = df['Location'].map(self.location_mapping)
         df['T_stage'] = df['T_stage'].map(self.t_stage_mapping)
         df['N_stage'] = df['N_stage'].map(self.n_stage_mapping)
         df['M_stage'] = df['M_stage'].map(self.m_stage_mapping)
+
+        # 確保有 Case_Index 列
+        if 'Case_Index' not in df.columns and 'ID' in df.columns:
+            df['Case_Index'] = df['ID']
 
         df.to_csv(self.output_csv_path, index=False)
         return df

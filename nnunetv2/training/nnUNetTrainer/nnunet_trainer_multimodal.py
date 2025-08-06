@@ -46,13 +46,11 @@ from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_sc
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch._dynamo import OptimizedModule
 
-
+import csv
 import warnings
 from time import sleep
 
-
 def calculate_class_weights(labels, num_classes):
-    from collections import Counter
     counts = Counter(labels)
     total = sum(counts.values())
     weights = []
@@ -122,7 +120,7 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
             # 調用父類的 _set_batch_size_and_oversample 來處理 DDP 批次大小
             self._set_batch_size_and_oversample()
 
-            # 設置臨床損失的權重，可能需要根據實驗調整
+            # 設置臨床損失權重的初始值
             self.clinical_loss_weights = {
                 'location': 0.0,  # 位置分類損失權重
                 't_stage': 0.0,
@@ -130,7 +128,7 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
                 'm_stage': 0.0
             }
 
-            # 設定目標權重 (根據你的需求)
+            # 設置臨床損失權重的終點
             self.target_clinical_loss_weights = {
                 'location': 1.0,      # 位置分類損失權重最高
                 't_stage': 0.5,       # T 分期權重次之
@@ -224,10 +222,13 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
                                       ignore_label=self.label_manager.ignore_label)
         
         # 如果啟用深度監督，則包裝分割損失
+        # 每層的權重會是 [1, 0.5, 0.25 ...] 等等
+        # 最深層的權重 需要是 0 否則會有問題
         if self.enable_deep_supervision:
             from nnunetv2.training.loss.deep_supervision import DeepSupervisionWrapper
             deep_supervision_scales = self._get_deep_supervision_scales()
             weights = np.array([1 / (2 ** i) for i in range(len(deep_supervision_scales))])
+            # 如果是 ddp 並且沒有 compile，則最後一個權重設為 1e-6
             if self.is_ddp and not self._do_i_compile():
                 weights[-1] = 1e-6 # DDP 和 compile 的特殊處理
             else:
@@ -1078,9 +1079,9 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
             device=self.device,
             verbose=False,
             verbose_preprocessing=False,
-            allow_tqdm=False
+            allow_tqdm=False,
+            clinical_data_dir = self.clinical_data_dir,  # 傳入臨床資料目錄
         )
-        print("nnUNetPredictorMultimodal 已初始化")
 
         # 手動初始化 predictor，傳入訓練好的網路和相關設定
         # 這裡的 self.network 已經是 MyMultiModel，會被正確傳遞
@@ -1094,6 +1095,11 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
             self.inference_allowed_mirroring_axes
         )
 
+        # 初始化臨床編碼器
+        predictor.initialize_clinical_encoder()
+
+        print("nnUNetPredictorMultimodal 已初始化")
+
         # 建立多行程池用於匯出分割結果
         with multiprocessing.get_context("spawn").Pool(default_num_processes) as segmentation_export_pool:
             worker_list = [i for i in segmentation_export_pool._pool]
@@ -1103,13 +1109,17 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
             # 獲取驗證集鍵列表
             _, val_keys = self.do_split()
 
+            # # [DEBUG用] 只取前五個案例進行測試
+            # val_keys = val_keys[:5]
+
+
             # 如果是 DDP (分散式數據並行) 模式，則將驗證鍵分配給不同的進程
             if self.is_ddp:
                 last_barrier_at_idx = len(val_keys) // dist.get_world_size() - 1
                 val_keys = val_keys[self.local_rank:: dist.get_world_size()]
 
             # 建立驗證資料集物件 (確保使用正確的 Dataset 類別和 clinical_data_dir)
-            if self.is_stage2_dataset:
+            try:
                 # Stage 2 訓練：使用多模態 Dataset 並傳入臨床資料路徑
                 dataset_val = self.dataset_class(
                     self.preprocessed_dataset_folder,
@@ -1117,13 +1127,8 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
                     folder_with_segs_from_previous_stage=self.folder_with_segs_from_previous_stage,
                     clinical_data_dir=self.clinical_data_dir
                 )
-            else:
-                # Stage 1 訓練：使用原始 Dataset 類別 (不傳遞臨床資料路徑)
-                dataset_val = self.dataset_class( 
-                    self.preprocessed_dataset_folder,
-                    val_keys,
-                    folder_with_segs_from_previous_stage=self.folder_with_segs_from_previous_stage
-                )
+            except TypeError as e:
+                raise ValueError("perform_actual_validation 建立資料集錯誤: {}".format(e))
 
             next_stages = self.configuration_manager.next_stage_names
             if next_stages is not None:
@@ -1360,24 +1365,17 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
 
                     for cli_type, (true_labels, pred_labels, mask_labels, num_classes) in clis_to_evaluate.items():
                         metrics = self.compute_clinical_metrics(true_labels, pred_labels, mask_labels, num_classes)
-                        # logger
-                        self.logger.log(f'{cli_type}_accs', metrics['acc'], self.current_epoch)
-                        self.logger.log('clinical_metrics', {
-                            cli_type: {
-                                'precision': metrics['precision'],
-                                'recall': metrics['recall'],
-                                'f1': metrics['f1'],
-                                'per_class_metrics': metrics['per_class_acc']
-                            }
-                        }, self.current_epoch)
-                        self.logger.log('confusion_matrices', {f'{cli_type}_confusion_matrix': metrics['confusion_matrix'].tolist() if metrics['confusion_matrix'] is not None else None}, self.current_epoch)
+                        # logger 記錄臨床指標
                         self.print_to_log_file(f"- {cli_type} 準確率 (Accuracy): {np.round(metrics['acc'], 4) if metrics['acc'] is not None else 'N/A'}", add_timestamp=False)
                         self.print_to_log_file(f"- {cli_type} F1 分數 (F1 Score): {np.round(metrics['f1'], 4) if metrics['f1'] is not None else 'N/A'}", add_timestamp=False)
+                        self.print_to_log_file(f"- {cli_type} Precision: {np.round(metrics['precision'], 4) if metrics['precision'] is not None else 'N/A'}", add_timestamp=False)
+                        self.print_to_log_file(f"- {cli_type} Recall: {np.round(metrics['recall'], 4) if metrics['recall'] is not None else 'N/A'}", add_timestamp=False)
                         self.print_to_log_file(f"- {cli_type} 有效比例 (Valid Ratio): {np.round(metrics['valid_ratio'], 4)}", add_timestamp=False)
+                        self.print_to_log_file(f"- {cli_type} Per-class Acc: {metrics['per_class_acc']}", add_timestamp=False)
+                        if metrics['confusion_matrix'] is not None:
+                            self.print_to_log_file(f"- {cli_type} Confusion Matrix:\n{metrics['confusion_matrix']}", add_timestamp=False)
 
                     # 保存臨床結果到 CSV 檔案
-                    import csv
-                    import numpy as np
                     csv_path = os.path.join(validation_output_folder, "clinical_infer_results.csv")
                     total_cases = len(all_pred_loc_labels)
                     stat = {}
@@ -1413,15 +1411,21 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
                             m_true_idx = all_m_label_labels[i].item() if hasattr(all_m_label_labels[i], "item") else all_m_label_labels[i]
                             m_pred_idx = all_pred_m_labels[i]
 
-                            # 利用 reverse mapping 將 label 數字轉回原始文字（如 T1, N0, 等）
-                            loc_true_str = self.reverse_location_mapping.get(loc_true_idx, str(loc_true_idx)) # 真實 location 標籤
-                            loc_pred_str = self.reverse_location_mapping.get(loc_pred_idx, str(loc_pred_idx)) # 預測 location 標籤
-                            t_true_str = self.reverse_t_stage_mapping.get(t_true_idx, str(t_true_idx))         # 真實 t_stage 標籤
-                            t_pred_str = self.reverse_t_stage_mapping.get(t_pred_idx, str(t_pred_idx))         # 預測 t_stage 標籤
-                            n_true_str = self.reverse_n_stage_mapping.get(n_true_idx, str(n_true_idx))         # 真實 n_stage 標籤
-                            n_pred_str = self.reverse_n_stage_mapping.get(n_pred_idx, str(n_pred_idx))         # 預測 n_stage 標籤
-                            m_true_str = self.reverse_m_stage_mapping.get(m_true_idx, str(m_true_idx))         # 真實 m_stage 標籤
-                            m_pred_str = self.reverse_m_stage_mapping.get(m_pred_idx, str(m_pred_idx))         # 預測 m_stage 標籤
+                            # 使用 reverse mapping 將索引轉換為文字標籤
+                            encoder = dataset_val.clinical_data_label_encoder
+                            loc_missing = encoder.missing_flag_location
+                            t_missing = encoder.missing_flag_t_stage
+                            n_missing = encoder.missing_flag_n_stage
+                            m_missing = encoder.missing_flag_m_stage
+
+                            loc_true_str = 'Missing' if loc_true_idx == loc_missing else encoder.reverse_location_mapping.get(loc_true_idx, str(loc_true_idx))
+                            loc_pred_str = 'Missing' if loc_pred_idx == loc_missing else encoder.reverse_location_mapping.get(loc_pred_idx, str(loc_pred_idx))
+                            t_true_str = 'Missing' if t_true_idx == t_missing else encoder.reverse_t_stage_mapping.get(t_true_idx, str(t_true_idx))
+                            t_pred_str = 'Missing' if t_pred_idx == t_missing else encoder.reverse_t_stage_mapping.get(t_pred_idx, str(t_pred_idx))
+                            n_true_str = 'Missing' if n_true_idx == n_missing else encoder.reverse_n_stage_mapping.get(n_true_idx, str(n_true_idx))
+                            n_pred_str = 'Missing' if n_pred_idx == n_missing else encoder.reverse_n_stage_mapping.get(n_pred_idx, str(n_pred_idx))
+                            m_true_str = 'Missing' if m_true_idx == m_missing else encoder.reverse_m_stage_mapping.get(m_true_idx, str(m_true_idx))
+                            m_pred_str = 'Missing' if m_pred_idx == m_missing else encoder.reverse_m_stage_mapping.get(m_pred_idx, str(m_pred_idx))
 
                             # 寫入一行案例資料到 CSV，每個欄位都已經是文字標籤
                             writer.writerow([
@@ -1478,9 +1482,7 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
         num_classes: int
         回傳 dict: acc, f1, precision, recall, confusion_matrix, per_class_acc, valid_count, valid_ratio
         """
-        import numpy as np
-        from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, confusion_matrix
-    
+
         true_labels_np = np.array([t.item() if hasattr(t, 'item') else t for t in true_labels])
         pred_labels_np = np.array(pred_labels)
         mask_np = np.array([m.item() if hasattr(m, 'item') else m for m in mask])

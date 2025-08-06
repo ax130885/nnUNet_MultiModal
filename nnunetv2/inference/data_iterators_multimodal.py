@@ -12,6 +12,8 @@ from batchgenerators.utilities.file_and_folder_operations import load_pickle, is
 from nnunetv2.utilities.plans_handling.plans_handler import PlansManager, ConfigurationManager
 from nnunetv2.utilities.label_handling.label_handling import determine_num_input_channels
 from nnunetv2.preprocessing.clinical_data_label_encoder import ClinicalDataLabelEncoder
+from nnunetv2.training.dataloading.nnunet_dataset_multimodal import nnUNetDatasetMultimodal
+
 
 
 import multiprocessing
@@ -19,6 +21,9 @@ import queue
 from time import sleep
 from torch.multiprocessing import Event, Queue, Manager
 from nnunetv2.utilities.label_handling.label_handling import convert_labelmap_to_one_hot
+import pandas as pd
+import os
+
 
 
 def preprocess_fromfiles_save_to_queue_multimodal(list_of_lists: List[List[str]],
@@ -52,6 +57,10 @@ def preprocess_fromfiles_save_to_queue_multimodal(list_of_lists: List[List[str]]
     """
     total_cases = len(list_of_lists)
     print(f"該 iterator worker 收到總共 {total_cases} 筆資料")
+    if verbose:
+        for idx, item in enumerate(list_of_lists):
+            case_id = item[0] if isinstance(item, list) else item
+            print(f"[DEBUG] iterator 第{idx+1}筆: {case_id}")
 
     try:
         # 取得標籤管理器（用於分割標籤 one-hot 編碼）
@@ -65,7 +74,6 @@ def preprocess_fromfiles_save_to_queue_multimodal(list_of_lists: List[List[str]]
         missing_flags = None
         if clinical_data_dir:
             try:
-                from nnunetv2.preprocessing.clinical_data_label_encoder import ClinicalDataLabelEncoder
                 clinical_data_label_encoder = ClinicalDataLabelEncoder(clinical_data_dir)
                 missing_flags = {
                     'location': clinical_data_label_encoder.missing_flag_location,
@@ -73,14 +81,34 @@ def preprocess_fromfiles_save_to_queue_multimodal(list_of_lists: List[List[str]]
                     'n_stage': clinical_data_label_encoder.missing_flag_n_stage,
                     'm_stage': clinical_data_label_encoder.missing_flag_m_stage
                 }
+
+                # 讀取原始 CSV 檔案
+                # 進行預處理 (label encoding)
+                clinical_full_df = clinical_data_label_encoder.forward()  # 讀取並編碼臨床資料
+                # 如果有 Case_Index 欄位，則設為索引
+                if 'Case_Index' in clinical_full_df.columns:
+                    clinical_full_df = clinical_full_df.set_index('Case_Index', drop=False)
+                    
+                # 印出 CSV 中的 Case_Index 範例，用於調試
+                unique_cases = clinical_full_df['Case_Index'].unique()
+                # print(f"包含 {len(unique_cases)} 個唯一案例ID")
+                if len(unique_cases) > 0:
+                    sample_cases = unique_cases[:5] if len(unique_cases) >= 5 else unique_cases
+                
+                print(f"臨床數據編碼器初始化成功")
+
+                # print(f"clinical_full_df: {clinical_full_df}")                
+
             except Exception as e:
                 if verbose:
                     print(f"[警告] 無法初始化 ClinicalDataLabelEncoder: {e}")
         # ------------------------------------------
 
         # 逐一處理每個案例
+        print(f"worker啟動，正在處理 {total_cases} 筆資料\n\n\n")
+        
         for idx in range(len(list_of_lists)):
-            # 執行預處理：讀取影像與分割檔案，並回傳預處理後的資料與屬性
+            # # 執行預處理：讀取影像與分割檔案，並回傳預處理後的資料與屬性
             data, seg, data_properties = preprocessor.run_case(
                 list_of_lists[idx],
                 list_of_segs_from_prev_stage_files[idx] if list_of_segs_from_prev_stage_files is not None else None,
@@ -88,6 +116,7 @@ def preprocess_fromfiles_save_to_queue_multimodal(list_of_lists: List[List[str]]
                 configuration_manager,
                 dataset_json
             )
+            
             # 如果有前階段分割，則將分割標籤做 one-hot 編碼並合併到影像資料
             if list_of_segs_from_prev_stage_files is not None and list_of_segs_from_prev_stage_files[idx] is not None:
                 seg_onehot = convert_labelmap_to_one_hot(seg[0], label_manager.foreground_labels, data.dtype)
@@ -98,12 +127,13 @@ def preprocess_fromfiles_save_to_queue_multimodal(list_of_lists: List[List[str]]
 
 
             # ---------------------臨床資料用 新增的部份---------------------
-            # 讀取臨床資料
+            # 初始化該案例的臨床資料
+            # 先將全部特徵設為缺失
             clinical_data = {
-                'location': missing_flags.get('location', -1) if missing_flags else -1,
-                't_stage': missing_flags.get('t_stage', -1) if missing_flags else -1,
-                'n_stage': missing_flags.get('n_stage', -1) if missing_flags else -1,
-                'm_stage': missing_flags.get('m_stage', -1) if missing_flags else -1
+                'location': missing_flags.get('location', -1),
+                't_stage': missing_flags.get('t_stage', -1),
+                'n_stage': missing_flags.get('n_stage', -1),
+                'm_stage': missing_flags.get('m_stage', -1)
             }
             
             clinical_mask = {
@@ -113,13 +143,29 @@ def preprocess_fromfiles_save_to_queue_multimodal(list_of_lists: List[List[str]]
                 'm_stage': False
             }
 
-            # 從臨床資料檔案讀取數據
-            case_id = data_properties.get('case_identifier', None)
+            row = None
+
+            # 找到該次預處理的 case id
+            if verbose:
+                print(f"正在處理案例 {idx + 1}/{total_cases}: {list_of_lists[idx]}")
+            image_path = list_of_lists[idx][0]
+            case_id = os.path.basename(image_path).split('.')[0] # 例如 去除路徑
+            
+            # 從檔名獲取案例ID，移除 _0000 後綴
+            original_case_id = case_id
+            if '_0000' in case_id:
+                case_id = case_id.split('_0000')[0]  # 只取 colon_266
+            
+            if verbose:
+                print(f"獲取案例ID: {original_case_id} -> {case_id}")
+
             if case_id and clinical_data_label_encoder:
                 try:
-                    df = clinical_data_label_encoder.clinical_full_df
-                    row = df[df['Case_Index'] == case_id]
-                    
+
+                    # 抓出該案例的所有特徵
+                    row = clinical_full_df[clinical_full_df['Case_Index'] == case_id]
+
+                    # 檢查是否找到了案例資料
                     if not row.empty:
                         clinical_data['location'] = row['Location'].values[0]
                         clinical_data['t_stage'] = row['T_stage'].values[0]
@@ -131,6 +177,10 @@ def preprocess_fromfiles_save_to_queue_multimodal(list_of_lists: List[List[str]]
                         clinical_mask['t_stage'] = clinical_data['t_stage'] != missing_flags.get('t_stage', -1)
                         clinical_mask['n_stage'] = clinical_data['n_stage'] != missing_flags.get('n_stage', -1)
                         clinical_mask['m_stage'] = clinical_data['m_stage'] != missing_flags.get('m_stage', -1)
+                    else:
+                        # 找不到案例時，輸出警告並保持默認值（全部設為缺失）
+                        print(f"警告: 在臨床數據中找不到案例 {case_id}，使用缺失值")
+                
                 except Exception as e:
                     if verbose:
                         print(f"[警告] 讀取臨床數據失敗: {e}")
@@ -151,7 +201,9 @@ def preprocess_fromfiles_save_to_queue_multimodal(list_of_lists: List[List[str]]
                 'clinical_data': clinical_data,  # 臨床數據字典
                 'clinical_mask': clinical_mask,  # 臨床掩碼字典
                 'properties': data_properties,  # 數據屬性
-                'ofile': output_filenames_truncated[idx] if output_filenames_truncated is not None else None  # 輸出文件路徑
+                'ofile': output_filenames_truncated[idx] if output_filenames_truncated is not None else None,  # 輸出文件路徑
+                # 'case_id': case_id,  # 案例識別符
+                # 'row': row
             }
 
             # 嘗試將 item 放入 queue，若 queue 滿則重試，直到成功或 abort_event 被觸發
@@ -161,11 +213,11 @@ def preprocess_fromfiles_save_to_queue_multimodal(list_of_lists: List[List[str]]
                     if abort_event.is_set():
                         # 若有 abort 訊號則直接結束
                         return
-                    target_queue.put(item, timeout=0.01)
+                    target_queue.put(item, timeout=1.0)  # 增加超時時間到1秒
                     success = True
                 except queue.Full:
-                    # queue 滿時等待重試
-                    pass
+                    # queue 滿時等待一會兒再重試
+                    sleep(0.5)  # 增加等待時間，避免過度佔用 CPU
         # 所有案例處理完畢，設定完成事件
         done_event.set()
     except Exception as e:
@@ -235,27 +287,109 @@ def preprocessing_iterator_fromfiles_multimodal(list_of_lists: List[List[str]],
 
     # 主進程輪詢各 worker 的 queue，依序取得預處理結果
     worker_ctr = 0
-    while (not done_events[worker_ctr].is_set()) or (not target_queues[worker_ctr].empty()):
-        # 若 queue 有資料，則取出並 yield 給後續流程
+    all_workers_done = False
+    timeout_counter = 0
+    max_timeout = 300  # 最大等待時間 (秒)
+    
+    while not all_workers_done:
         if not target_queues[worker_ctr].empty():
+            # 若 queue 有資料，則取出並 yield 給後續流程
             item = target_queues[worker_ctr].get()
             worker_ctr = (worker_ctr + 1) % num_processes
+            timeout_counter = 0  # 重置超時計數器
+            
+            # 若需將資料放到 CUDA pinned memory（加速 GPU 傳輸），則執行 pin_memory
+            if pin_memory:
+                [i.pin_memory() for i in item.values() if isinstance(i, torch.Tensor)]
+                
+            yield item  # 回傳預處理後的 batch 給主流程
         else:
-            # 檢查所有 worker 是否正常運作，若有異常則報錯
-            all_ok = all(
-                [i.is_alive() or j.is_set() for i, j in zip(processes, done_events)]) and not abort_event.is_set()
-            if not all_ok:
-                raise RuntimeError('Background workers died. Look for the error message further up! If there is '
-                                   'none then your RAM was full and the worker was killed by the OS. Use fewer '
-                                   'workers or get more RAM in that case!')
-            sleep(0.01)
-            continue
-        # 若需將資料放到 CUDA pinned memory（加速 GPU 傳輸），則執行 pin_memory
-        if pin_memory:
-            [i.pin_memory() for i in item.values() if isinstance(i, torch.Tensor)]
-        yield item  # 回傳預處理後的 batch 給主流程
+            # 如果當前 worker 的 queue 為空，檢查它是否已完成
+            if done_events[worker_ctr].is_set():
+                # 當前 worker 已完成且 queue 為空，嘗試下一個 worker
+                worker_ctr = (worker_ctr + 1) % num_processes
+                timeout_counter = 0  # 重置超時計數器
+                
+                # 檢查是否所有 worker 都已完成且 queue 都為空
+                all_workers_done = all([e.is_set() for e in done_events]) and \
+                                  all([q.empty() for q in target_queues])
+            else:
+                # 檢查所有 worker 是否正常運作，若有異常則報錯
+                all_ok = all(
+                    [i.is_alive() or j.is_set() for i, j in zip(processes, done_events)]) and not abort_event.is_set()
+                if not all_ok:
+                    raise RuntimeError('Background workers died. Look for the error message further up! If there is '
+                                      'none then your RAM was full and the worker was killed by the OS. Use fewer '
+                                      'workers or get more RAM in that case!')
+                
+                sleep(0.1)  # 稍微等待一下再重試
+                timeout_counter += 1
+                
+                # 超時處理 - 每 30 秒報告一次等待狀態
+                if timeout_counter % 300 == 0:  # 每 30 秒
+                    print(f"仍在等待 worker {worker_ctr} 處理數據... 已等待 {timeout_counter/10} 秒")
+                    
+                # 如果超過最大等待時間，強制切換到下一個 worker
+                if timeout_counter > max_timeout * 10:  # 乘以 10 因為每次等待 0.1 秒
+                    print(f"警告: worker {worker_ctr} 處理超時，切換到下一個 worker")
+                    worker_ctr = (worker_ctr + 1) % num_processes
+                    timeout_counter = 0
 
     # 等待所有 worker 結束
     [p.join() for p in processes]
 
 
+if __name__ == "__main__":
+    from nnunetv2.utilities.plans_handling.plans_handler import PlansManager, ConfigurationManager
+    from batchgenerators.utilities.file_and_folder_operations import load_json
+
+    plans = load_json("/mnt/data1/graduate/yuxin/Lab/model/UNet_base/nnunet_ins_data/data_test/nnUNet_results/Dataset101/nnUNetTrainerMultimodal__nnUNetPlans__3d_fullres/plans.json")
+    plans_manager = PlansManager(plans)
+    configuration_manager = plans_manager.get_configuration("3d_fullres")
+    dataset_json = {
+        "name": "NTUH_Colon",
+        "description": "NTUH Colon Cancer segmentation",
+        "reference": "NTUH",
+        "tensorImageSize": "3D",
+        "labels": {
+            "background": 0,
+            "colon cancer primaries": 1
+        },
+        "numTraining": 189,
+        "numTest": 22,
+        "file_ending": ".nii.gz",
+        "channel_names": {
+            "0": "CT"
+        }
+    }
+
+    # 直接呼叫，不用 queue/event
+    result = []
+    def fake_put(item, timeout=None):
+        print("put item:", item.keys())
+        result.append(item)
+    class FakeQueue:
+        def put(self, item, timeout=None):
+            fake_put(item, timeout)
+    class FakeEvent:
+        def set(self): pass
+        def is_set(self): return False
+
+    preprocess_fromfiles_save_to_queue_multimodal(
+        list_of_lists=[["/mnt/data1/graduate/yuxin/Lab/model/UNet_base/nnunet_ins_data/data_test/nnUNet_raw/Dataset101/imagesTs/colon_266_0000.nii.gz"],
+                       ["/mnt/data1/graduate/yuxin/Lab/model/UNet_base/nnunet_ins_data/data_test/nnUNet_raw/Dataset101/imagesTs/colon_267_0000.nii.gz"]],
+        list_of_segs_from_prev_stage_files=None,
+        output_filenames_truncated=None,
+        plans_manager=plans_manager,
+        dataset_json=dataset_json,
+        configuration_manager=configuration_manager,
+        target_queue=FakeQueue(),
+        done_event=FakeEvent(),
+        abort_event=FakeEvent(),
+        verbose=True,
+        clinical_data_dir="/mnt/data1/graduate/yuxin/Lab/model/UNet_base/nnunet_ins_data/data_test/nnUNet_raw/Dataset101"
+    )
+    print(f"result: {result}\n\n")
+    print("clinical_data: \n", result[0]['clinical_data'], "\n")
+    print("clinical_mask: \n", result[0]['clinical_mask'], "\n")
+    print("data_properties: \n", result[0]['properties'], "\n")

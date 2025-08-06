@@ -524,38 +524,68 @@ class nnUNetPredictor(object):
         return prediction
 
     def _internal_get_sliding_window_slicers(self, image_size: Tuple[int, ...]):
+        """
+        根據影像尺寸與 patch_size，計算滑動窗口切片器（slicers）列表。
+        每個 slicer 都是一組 slice 物件，用來從原始影像中切出一個 patch。
+        適用於 2D/3D 影像，支援多通道（如 MRI 多模態）。
+
+        Args:
+            image_size (Tuple[int, ...]): 影像的 shape，例如 (C, X, Y, Z)。
+
+        Returns:
+            slicers (List[Tuple[slice, ...]]): 
+                - 回傳一個 list，裡面每個元素都是 tuple，代表一個 patch 的切片座標規則。
+                - 例如 3D 影像: (slice(None), slice(x_start, x_end), slice(y_start, y_end), slice(z_start, z_end))
+                - 例如多通道 2D 影像: (slice(None), 通道索引, slice(x_start, x_end), slice(y_start, y_end))
+                - 這些 tuple 可直接用於 numpy/tensor 的切片操作：data[slicer] 取得對應 patch。
+        """
         slicers = []
+        # 判斷 patch_size 維度是否比影像少一維（例如多通道影像）
         if len(self.configuration_manager.patch_size) < len(image_size):
+            # 檢查維度差異是否只差一維（通常是通道維度）
             assert len(self.configuration_manager.patch_size) == len(
-                image_size) - 1, 'if tile_size has less entries than image_size, ' \
-                                 'len(tile_size) ' \
-                                 'must be one shorter than len(image_size) ' \
-                                 '(only dimension ' \
-                                 'discrepancy of 1 allowed).'
-            steps = compute_steps_for_sliding_window(image_size[1:], self.configuration_manager.patch_size,
-                                                     self.tile_step_size)
-            if self.verbose: print(f'n_steps {image_size[0] * len(steps[0]) * len(steps[1])}, image size is'
-                                   f' {image_size}, tile_size {self.configuration_manager.patch_size}, '
-                                   f'tile_step_size {self.tile_step_size}\nsteps:\n{steps}')
-            for d in range(image_size[0]):
-                for sx in steps[0]:
-                    for sy in steps[1]:
+                image_size) - 1, '如果 tile_size 維度比 image_size 少，必須只差一維（通常是通道維度）'
+            # 計算每個空間維度的滑動步驟（不含通道維度）
+            steps = compute_steps_for_sliding_window(
+                image_size[1:],  # 去掉通道維度
+                self.configuration_manager.patch_size,
+                self.tile_step_size
+            )
+            if self.verbose:
+                print(f'總步數: {image_size[0] * len(steps[0]) * len(steps[1])}, 影像尺寸: {image_size}, patch_size: {self.configuration_manager.patch_size}, tile_step_size: {self.tile_step_size}\nsteps:\n{steps}')
+            # 依序產生所有 patch 的切片座標
+            for d in range(image_size[0]):  # 通道維度（如 MRI 多模態）
+                for sx in steps[0]:         # X 軸起始座標
+                    for sy in steps[1]:     # Y 軸起始座標
+                        # 建立切片器：slice(None) 表示所有通道，d 表示第幾通道，後面是空間座標
                         slicers.append(
-                            tuple([slice(None), d, *[slice(si, si + ti) for si, ti in
-                                                     zip((sx, sy), self.configuration_manager.patch_size)]]))
+                            tuple([
+                                slice(None),  # 保留所有通道
+                                d,            # 指定通道
+                                *[slice(si, si + ti) for si, ti in zip((sx, sy), self.configuration_manager.patch_size)]
+                            ])
+                        )
         else:
-            steps = compute_steps_for_sliding_window(image_size, self.configuration_manager.patch_size,
-                                                     self.tile_step_size)
-            if self.verbose: print(
-                f'n_steps {np.prod([len(i) for i in steps])}, image size is {image_size}, tile_size {self.configuration_manager.patch_size}, '
-                f'tile_step_size {self.tile_step_size}\nsteps:\n{steps}')
-            for sx in steps[0]:
-                for sy in steps[1]:
-                    for sz in steps[2]:
+            # patch_size 維度與影像一致（通常是 3D 影像）
+            steps = compute_steps_for_sliding_window(
+                image_size,
+                self.configuration_manager.patch_size,
+                self.tile_step_size
+            )
+            if self.verbose:
+                print(f'總步數: {np.prod([len(i) for i in steps])}, 影像尺寸: {image_size}, patch_size: {self.configuration_manager.patch_size}, tile_step_size: {self.tile_step_size}\nsteps:\n{steps}')
+            # 依序產生所有 3D patch 的切片座標
+            for sx in steps[0]:  # X 軸起始座標
+                for sy in steps[1]:  # Y 軸起始座標
+                    for sz in steps[2]:  # Z 軸起始座標
+                        # 建立切片器：slice(None) 表示所有通道，後面是空間座標
                         slicers.append(
-                            tuple([slice(None), *[slice(si, si + ti) for si, ti in
-                                                  zip((sx, sy, sz), self.configuration_manager.patch_size)]]))
-        return slicers
+                            tuple([
+                                slice(None),  # 保留所有通道
+                                *[slice(si, si + ti) for si, ti in zip((sx, sy, sz), self.configuration_manager.patch_size)]
+                            ])
+                        )
+        return slicers  # 回傳格式：List[Tuple[slice, ...]]，每個 tuple 可直接用於 data[slicer] 取得 patch
 
     @torch.inference_mode()
     def _internal_maybe_mirror_and_predict(self, x: torch.Tensor) -> torch.Tensor:

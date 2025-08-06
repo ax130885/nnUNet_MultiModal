@@ -11,39 +11,6 @@ from nnunetv2.preprocessing.clinical_data_label_encoder import ClinicalDataLabel
 import matplotlib.pyplot as plt
 import numpy as np
 
-# def visualize_gate(gate,           # [B, C, D, H, W]
-#                    batch_idx=0,    # 要看哪一個 batch
-#                    channel_idx=0,  # 要看哪一個 channel（可設 None 取平均）
-#                    save_path=None):
-#     """
-#     把 3D gate 權重圖投影成 2D 並顯示 / 儲存
-#     gate: torch.Tensor, shape (B, C, D, H, W)
-#     """
-#     gate_np = gate[batch_idx].detach().cpu().numpy()  # [C, D, H, W]
-
-#     # 如果 channel_idx=None → 取所有 channel 平均
-#     if channel_idx is None:
-#         gate_2d = np.mean(gate_np, axis=0)            # [D, H, W]
-#     else:
-#         gate_2d = gate_np[channel_idx]                # [D, H, W]
-
-#     # 沿深度方向再平均 ⇒ [H, W]
-#     gate_2d = np.mean(gate_2d, axis=0)
-
-#     plt.figure(figsize=(4, 4))
-#     plt.title(f"Gate (avg over depth) - batch {batch_idx}")
-#     plt.imshow(gate_2d, cmap='jet', vmin=0, vmax=1)
-#     plt.colorbar()
-#     plt.axis('off')
-#     if save_path:
-#         plt.savefig(save_path, bbox_inches='tight')
-#         print(f"Gate visualization saved to {save_path}")
-#         plt.close()
-#     else:
-#         plt.show()
-#         plt.close()
-#     torch.cuda.empty_cache()
-
 class GatedFusion(nn.Module):
     def __init__(self, channels: int):
         super().__init__()
@@ -98,11 +65,6 @@ class GatedFusion(nn.Module):
         gate = self.gate_conv(combined) # 計算權重
         fused = (1 - gate) * proj_img + gate * proj_cli  # 套用權重得到embedding
         out = fused + self.final_fusion(fused) # 套用殘差結構 逐元素相加
-
-        # # ------- 可視化 gate（只在 eval 或 debug 時用） -------
-        # # 避免訓練時拖慢速度
-        # if not self.training:
-        #     visualize_gate(gate, batch_idx=0, channel_idx=0, save_path=os.path.join(os.getcwd(), f"visualize_gate.png"))
 
         return out
 
@@ -390,16 +352,6 @@ class MyMultiModel(nn.Module):
                 t_out.append(self.t_head(cli_raw_out))
                 n_out.append(self.n_head(cli_raw_out))
                 m_out.append(self.m_head(cli_raw_out))
-
-        # print(f"seg_out len: {len(seg_out)}")  # 假設有啟動深度監督 
-        # print(f"loc_out len: {len(loc_out)}")  # 返回的是一個列表 保存每個解析度的輸出
-        # print(f"seg_out[0] shape: {seg_out[0].shape}") # [B, C, D, H, W]
-        # print(f"loc_out[0] shape: {loc_out[0].shape}") # [B, C=6]
-        # print(f"t_out[0] shape: {t_out[0].shape}")   # [B, C=5]
-        # print(f"n_out[0] shape: {n_out[0].shape}") # [B, C=3]
-        # print(f"m_out[0] shape: {m_out[0].shape}") # [B, C=2]
-
-        # breakpoint()  # 調試用
 
         # 反轉輸出順序
         seg_out = seg_out[::-1] #[start, end, step]
