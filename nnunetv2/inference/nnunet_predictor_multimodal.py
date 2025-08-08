@@ -738,7 +738,7 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
 
             # 如果無法獲取 init_kwargs，使用預設值
             cli_output_shapes = {
-                'location': (self.num_clinical_classes['location'],),  # 預設 7 個類別
+                'location': (self.num_clinical_classes['location'],),  # 預設 8 個類別
                 't_stage': (self.num_clinical_classes['t_stage'],),   # 預設 6 個類別
                 'n_stage': (self.num_clinical_classes['n_stage'],),   # 預設 4 個類別
                 'm_stage': (self.num_clinical_classes['m_stage'],),   # 預設 3 個類別
@@ -748,11 +748,11 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
             # 如果有 attr_init_kwargs，從中獲取類別數量
             if attr_init_kwargs:
                 cli_output_shapes = {
-                    'location': (attr_init_kwargs.get('num_location_classes', 7),),
-                    't_stage': (attr_init_kwargs.get('num_t_stage_classes', 6),),
-                    'n_stage': (attr_init_kwargs.get('num_n_stage_classes', 4),),
-                    'm_stage': (attr_init_kwargs.get('num_m_stage_classes', 3),),
-                    'missing_flags': (attr_init_kwargs.get('missing_flags_dim', 4),)
+                    'location': (attr_init_kwargs.get('num_location_classes'),),
+                    't_stage': (attr_init_kwargs.get('num_t_stage_classes'),),
+                    'n_stage': (attr_init_kwargs.get('num_n_stage_classes'),),
+                    'm_stage': (attr_init_kwargs.get('num_m_stage_classes'),),
+                    'missing_flags': (attr_init_kwargs.get('missing_flags_dim'),)
                 }
             
             # 初始化臨床屬性 logits 字典

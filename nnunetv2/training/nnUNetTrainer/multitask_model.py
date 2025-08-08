@@ -90,13 +90,13 @@ class MyMultiModel(nn.Module):
         encoder = ClinicalDataLabelEncoder(clinical_csv_dir)
 
         # 讀取臨床資料的類別數
-        self.num_location_classes = encoder.num_location_classes # 7
+        self.num_location_classes = encoder.num_location_classes # 8
         self.num_t_stage_classes = encoder.num_t_stage_classes # 6
         self.num_n_stage_classes = encoder.num_n_stage_classes # 4
         self.num_m_stage_classes = encoder.num_m_stage_classes # 3
 
         # 讀取臨床資料的缺失idx
-        self.missing_flag_location = encoder.missing_flag_location # 6
+        self.missing_flag_location = encoder.missing_flag_location # 7
         self.missing_flag_t_stage = encoder.missing_flag_t_stage # 5
         self.missing_flag_n_stage = encoder.missing_flag_n_stage # 3
         self.missing_flag_m_stage = encoder.missing_flag_m_stage # 2

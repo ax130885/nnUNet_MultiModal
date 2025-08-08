@@ -26,7 +26,8 @@ class ClinicalDataLabelEncoder:
             'sigmoid': 3, 
             'rectal': 4, 
             'rectosigmoid': 5,
-            'Missing': 6
+            'cecal': 6,
+            'Missing': 7
         }
         self.t_stage_mapping = {
             'T0': 0, 
