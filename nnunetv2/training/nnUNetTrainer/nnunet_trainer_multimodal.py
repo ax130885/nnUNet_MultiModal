@@ -495,18 +495,20 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
         覆寫父類的 train_step 方法。
         """
         # 從 DataLoader 獲取批次數據
-        # return {             # 因為啟動深度監督返回的都是 list of tensor，有五個解析度的輸出
-        #     'data':          torch.from_numpy(data_all).float(), # [stage][B, C, D, H, W] list of tensor
-        #     'target':        torch.from_numpy(seg_all).long(), # [stage][B, C, D, H, W] list of tensor
-        #     'clinical_data': clinical_data, # [stage][B, 4] list of tensor
-        #     'clinical_mask': clinical_mask, # [stage][B, 4] list of tensor
-        #     'keys':          selected_keys # [B] list of identifiers
+        # return {
+        #     'data': data_all,                    # [B, C, D, H, W] tensor
+        #     'target': seg_all,                   # [B, C, D, H, W] tensor
+        #     'clinical_data_aug': clinical_data_aug,      # 增強後的臨床資料 (模型輸入)
+        #     'clinical_data_label': clinical_data_label,  # 原始臨床資料 (計算loss用)
+        #     'clinical_mask': clinical_mask,              # 臨床資料 mask
+        #     'keys': selected_keys                        # [B] list of identifiers
         # }
 
         img_data = batch['data']
         seg_target = batch['target']
-        clinical_data = batch['clinical_data']
-        clinical_mask = batch['clinical_mask']
+        clinical_data_aug = batch['clinical_data_aug']      # 增強後的資料 (用於模型輸入)
+        clinical_data_label = batch['clinical_data_label']  # 原始資料 (用於計算loss)
+        clinical_mask = batch['clinical_mask']              # mask
         keys = batch['keys']
 
         # 將影像數據和seg label移動到指定設備
@@ -516,11 +518,17 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
         else: # 如果只有一種分割目標
             seg_target = seg_target.to(self.device, non_blocking=True)
 
-        # 將臨床特徵和標籤移動到指定設備
-        loc_label = torch.tensor(clinical_data['location']).to(self.device, non_blocking=True)
-        t_label = torch.tensor(clinical_data['t_stage']).to(self.device, non_blocking=True)
-        n_label = torch.tensor(clinical_data['n_stage']).to(self.device, non_blocking=True)
-        m_label = torch.tensor(clinical_data['m_stage']).to(self.device, non_blocking=True)
+        # 將臨床特徵(模型輸入)移動到指定設備
+        loc_input = torch.tensor(clinical_data_aug['location']).to(self.device, non_blocking=True)
+        t_input = torch.tensor(clinical_data_aug['t_stage']).to(self.device, non_blocking=True)
+        n_input = torch.tensor(clinical_data_aug['n_stage']).to(self.device, non_blocking=True)
+        m_input = torch.tensor(clinical_data_aug['m_stage']).to(self.device, non_blocking=True)
+
+        # 將臨床標籤(用於計算loss)移動到指定設備
+        loc_label = torch.tensor(clinical_data_label['location']).to(self.device, non_blocking=True)
+        t_label = torch.tensor(clinical_data_label['t_stage']).to(self.device, non_blocking=True)
+        n_label = torch.tensor(clinical_data_label['n_stage']).to(self.device, non_blocking=True)
+        m_label = torch.tensor(clinical_data_label['m_stage']).to(self.device, non_blocking=True)
 
         # Missing特徵的遮罩 用於計算損失時忽略
         loc_mask = torch.tensor(clinical_mask['location']).to(self.device, non_blocking=True)
@@ -534,13 +542,13 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
         with torch.autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else self.dummy_context():
             # 模型前向傳播：輸入影像和臨床特徵
             # MyMultiModel 返回 seg_out, cli_out
-            seg_out, cli_out = self.network(image_data, loc_label, t_label, n_label, m_label)
+            seg_out, cli_out = self.network(image_data, loc_input, t_input, n_input, m_input)
 
             # --- 計算分割損失 ---
             seg_loss_tr = self.loss(seg_out, seg_target)
 
              # 對於每個臨床屬性，計算 Focal Loss
-            # cli_out: 預測結果, loc_label: 真實標籤
+            # cli_out: 預測結果, loc_label: 真實標籤 (使用原始未增強的標籤計算loss)
             if self.enable_deep_supervision:
                 loc_loss_tr = self.focal_loss_loc(
                     cli_out['location'],           # list of tensor，每個分支一個 tensor
@@ -663,8 +671,9 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
         """
         img_data = batch['data']
         seg_target = batch['target']
-        clinical_data = batch['clinical_data']
-        clinical_mask = batch['clinical_mask']
+        clinical_data_aug = batch['clinical_data_aug']       # 增強後的資料 (用於模型輸入)
+        clinical_data_label = batch['clinical_data_label']   # 原始資料 (用於計算loss)
+        clinical_mask = batch['clinical_mask']               # mask
         keys = batch['keys']
 
         # 將影像數據和seg label移動到指定設備
@@ -674,11 +683,17 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
         else:
             seg_target = seg_target.to(self.device, non_blocking=True)
 
-        # 將臨床特徵和標籤移動到指定設備
-        loc_label = torch.tensor(clinical_data['location']).to(self.device, non_blocking=True)
-        t_label = torch.tensor(clinical_data['t_stage']).to(self.device, non_blocking=True)
-        n_label = torch.tensor(clinical_data['n_stage']).to(self.device, non_blocking=True)
-        m_label = torch.tensor(clinical_data['m_stage']).to(self.device, non_blocking=True)
+        # 將臨床特徵(模型輸入)移動到指定設備
+        loc_input = torch.tensor(clinical_data_aug['location']).to(self.device, non_blocking=True)
+        t_input = torch.tensor(clinical_data_aug['t_stage']).to(self.device, non_blocking=True)
+        n_input = torch.tensor(clinical_data_aug['n_stage']).to(self.device, non_blocking=True)
+        m_input = torch.tensor(clinical_data_aug['m_stage']).to(self.device, non_blocking=True)
+
+        # 將臨床標籤(用於計算loss)移動到指定設備
+        loc_label = torch.tensor(clinical_data_label['location']).to(self.device, non_blocking=True)
+        t_label = torch.tensor(clinical_data_label['t_stage']).to(self.device, non_blocking=True)
+        n_label = torch.tensor(clinical_data_label['n_stage']).to(self.device, non_blocking=True)
+        m_label = torch.tensor(clinical_data_label['m_stage']).to(self.device, non_blocking=True)
 
         # Missing特徵的遮罩 用於計算損失時忽略
         loc_mask = torch.tensor(clinical_mask['location']).to(self.device, non_blocking=True)
@@ -689,7 +704,7 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
         # 推論結果
         # Autocast 只在 CUDA 上啟用，CPU/MPS 不啟用以避免效能低落或報錯
         with torch.autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else self.dummy_context():
-            seg_out, cli_out = self.network(image_data, loc_label, t_label, n_label, m_label)
+            seg_out, cli_out = self.network(image_data, loc_input, t_input, n_input, m_input)
             # 釋放 image_data 記憶體，減少顯存佔用 (臨床特徵 還要計算指標用 別刪)
             del image_data
 
@@ -1213,6 +1228,9 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
                 
 
                 # 將臨床特徵字典轉換為 PyTorch 張量
+                # clinical_data 是原始標籤，在 validation 我們用其同時作為輸入和標籤，因為不需要資料增強
+                # 這與 train_step 和 validation_step 中區分 input 和 label 是不同的
+                # 在真實的 inference 階段，實際模型輸入可能是有缺失的，但在 validation 時我們使用完整資料評估模型性能
                 loc_label = torch.tensor(clinical_data['location']).to(self.device, non_blocking=True)
                 t_label = torch.tensor(clinical_data['t_stage']).to(self.device, non_blocking=True)
                 n_label = torch.tensor(clinical_data['n_stage']).to(self.device, non_blocking=True)

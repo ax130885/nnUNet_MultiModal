@@ -28,7 +28,9 @@ class nnUNetDataLoaderMultimodal(nnUNetDataLoader):
                  pad_sides: Union[List[int], Tuple[int, ...]] = None,
                  probabilistic_oversampling: bool = False,
                  transforms=None,
-                 clinical_drop_probability: float = 0.1):
+                 clinical_drop_probability_global: float = 0.3,
+                 clinical_drop_probability_column: float = 0.1
+                 ):
         """
         初始化多模態資料載入器。
         Args:
@@ -36,7 +38,8 @@ class nnUNetDataLoaderMultimodal(nnUNetDataLoader):
             其他參數同 nnUNetDataLoader。
         """
         # 設定 drop rate
-        self.clinical_drop_probability = clinical_drop_probability
+        self.clinical_drop_probability_global = clinical_drop_probability_global
+        self.clinical_drop_probability_column = clinical_drop_probability_column
 
         super().__init__(data, batch_size, patch_size, final_patch_size, label_manager,
                          oversample_foreground_percent, sampling_probabilities,
@@ -51,8 +54,6 @@ class nnUNetDataLoaderMultimodal(nnUNetDataLoader):
         self.missing_flags = data.missing_flags # 這是你提供的字典
         print(f"nnUNetDataLoaderMultimodal 初始化完成。有效類別數量=缺失標記: {self.missing_flags}")
 
-
-
     def generate_train_batch(self):
         """
         生成一個訓練批次，包括影像數據、標註和臨床資料。
@@ -65,8 +66,9 @@ class nnUNetDataLoaderMultimodal(nnUNetDataLoader):
         data_all = np.zeros(self.data_shape, dtype=np.float32)
         seg_all = np.zeros(self.seg_shape, dtype=np.int16)
 
-        # 初始化臨床資料
-        clinical_data = {'location': [], 't_stage': [], 'n_stage': [], 'm_stage': []}
+        # 初始化臨床資料（原始 label）
+        clinical_data_label = {'location': [], 't_stage': [], 'n_stage': [], 'm_stage': []}
+        # 初始化臨床資料 mask（是否有 label）
         clinical_mask = {'location': [], 't_stage': [], 'n_stage': [], 'm_stage': []}
 
         # j: 第幾次迴圈
@@ -74,7 +76,6 @@ class nnUNetDataLoaderMultimodal(nnUNetDataLoader):
         for j, i in enumerate(selected_keys):
             force_fg = self.get_do_oversample(j)
             
-                      
             # 從 nnUNetDatasetMultimodal 取得影像、標註、臨床資料和 mask
             data, seg, seg_prev, properties, clinical_data_dict, clinical_mask_bool = self._data.load_case(i)
 
@@ -90,23 +91,19 @@ class nnUNetDataLoaderMultimodal(nnUNetDataLoader):
                 seg_cropped = np.vstack((seg_cropped, crop_and_pad_nd(seg_prev, bbox, -1)[None]))
             seg_all[j] = seg_cropped
             
-            
+            # 儲存原始臨床資料作為 label（強制轉為 Python int）
             for k in ['location', 't_stage', 'n_stage', 'm_stage']:
-                clinical_data[k].append(clinical_data_dict[k])
-                clinical_mask[k].append(clinical_mask_bool[k])
+                clinical_data_label[k].append(int(clinical_data_dict[k]))
+                clinical_mask[k].append(bool(clinical_mask_bool[k]))
 
-
-                    
         # 2D 特例
         if self.patch_size_was_2d:
             data_all = data_all[:, :, 0]
             seg_all = seg_all[:, :, 0]
 
-
         # 套用影像的 Augmentation Transforms (與父類相同)
         if self.transforms is not None:
             with torch.no_grad():
-                # from threadpoolctl import threadpool_limits # already imported in nnUNetDataLoader
                 with threadpool_limits(limits=1, user_api=None):
                     data_all = torch.from_numpy(data_all).float()
                     seg_all = torch.from_numpy(seg_all).to(torch.int16)
@@ -123,49 +120,51 @@ class nnUNetDataLoaderMultimodal(nnUNetDataLoader):
                         seg_all = torch.stack(segs)
                     del segs, images
 
-
         # --- 新增：對臨床資料進行資料增強 (隨機 Drop) ---
-        # 此時 data_all 和 seg_all 已經是 PyTorch Tensor
-        # clinical_data 和 clinical_mask 還是 Python list (原始格式)
+        # 注意：這裡只對「輸入」做 drop，label 保持不變
+        clinical_data_aug = {k: v[:] for k, v in clinical_data_label.items()}  # 複製一份
+        clinical_mask_input = {k: v[:] for k, v in clinical_mask.items()}        # 複製一份
 
-        # 1. 將臨床資料 list 轉換為 PyTorch Tensor (用於高效增強)
+        # 1. 轉為 Tensor
         clinical_data_tensor = {}
         clinical_mask_tensor = {}
-        for key in clinical_data.keys():
-            # 確保資料是整數類型，適合索引和比較
-            clinical_data_tensor[key] = torch.tensor(clinical_data[key], dtype=torch.long)
-            clinical_mask_tensor[key] = torch.tensor(clinical_mask[key], dtype=torch.bool)
+        for key in clinical_data_aug.keys():
+            clinical_data_tensor[key] = torch.tensor(clinical_data_aug[key], dtype=torch.long)
+            clinical_mask_tensor[key] = torch.tensor(clinical_mask_input[key], dtype=torch.bool)
 
-        # 2. 執行隨機 Drop (使用 Tensor 操作)
-        #    只對原始有效的特徵 (mask=True) 進行 Drop
+        batch_size = next(iter(clinical_data_tensor.values())).size(0)
+
+        # 2. 執行隨機 Drop（只影響 input）
+        global_random_numbers = torch.rand(batch_size)
+        global_drop_mask = (global_random_numbers < self.clinical_drop_probability_global)
+
         for key in clinical_data_tensor.keys():
-            batch_size = clinical_data_tensor[key].size(0)
-            # 生成隨機數 [B]
-            random_numbers = torch.rand(batch_size)
-            # 生成 Drop mask: 當 random_number < drop_probability 且 原始 mask 為 True 時，Drop
-            drop_mask = (random_numbers < self.clinical_drop_probability) & clinical_mask_tensor[key]
-            # 應用 Drop: 將被選中的特徵值替換為對應的缺失標記
+            column_random_numbers = torch.rand(batch_size)
+            column_drop_mask = (column_random_numbers < self.clinical_drop_probability_column) & clinical_mask_tensor[key]
+            drop_mask = (global_drop_mask | column_drop_mask) & clinical_mask_tensor[key]
+
             clinical_data_tensor[key] = torch.where(
                 drop_mask,
                 torch.tensor(self.missing_flags[key], dtype=clinical_data_tensor[key].dtype),
                 clinical_data_tensor[key]
             )
-            # 更新 mask: 被 Drop 的特徵現在變為無效 (False)
-            clinical_mask_tensor[key] = clinical_mask_tensor[key] & (~drop_mask)
+            # 注意：不修改 clinical_mask_tensor，因為 mask 是原始 label 是否有效的標記
 
-        # 3. 將處理後的 Tensor 轉換回 Trainer 期望的格式 (dict of lists)
-        #    這是與原始程式碼的主要區別：轉換回來
-        clinical_data_final = {k: v.tolist() for k, v in clinical_data_tensor.items()}
-        clinical_mask_final = {k: v.tolist() for k, v in clinical_mask_tensor.items()}
+        # 3. 轉回 list 格式
+        clinical_data_aug = {k: v.tolist() for k, v in clinical_data_tensor.items()}
+        # mask 保持不變，使用原始值
+        clinical_mask_final = {k: v for k, v in clinical_mask.items()}
+
         # --- 結束新增 ---
 
         # 回傳結構
         return {
-            'data':          data_all, # [B, C, D, H, W] tensor
-            'target':        seg_all, # [B, C, D, H, W] tensor
-            'clinical_data': clinical_data_final, # {[B]} dict of lists, {'location': [B], 't_stage': [B], ...}
-            'clinical_mask': clinical_mask_final, # {[B]} dict of lists, {'location': [B], 't_stage': [B], ...}
-            'keys':          selected_keys # [B] list of identifiers
+            'data': data_all,                    # [B, C, D, H, W] tensor
+            'target': seg_all,                   # [B, C, D, H, W] tensor
+            'clinical_data_aug': clinical_data_aug,      # 增強後的臨床資料 (模型輸入)
+            'clinical_data_label': clinical_data_label,  # 原始臨床資料 (計算loss用)
+            'clinical_mask': clinical_mask_final,        # 臨床資料 mask
+            'keys': selected_keys                        # [B] list of identifiers
         }
 
 if __name__ == "__main__":
@@ -184,13 +183,15 @@ if __name__ == "__main__":
         batch_size=2,
         patch_size=(128, 128, 128),
         final_patch_size=(128, 128, 128),
-        label_manager=label_manager,  # 假設有一個 label manager
+        label_manager=label_manager,
         oversample_foreground_percent=0.5,
-        transforms=None  # 假設沒有使用任何 transforms
+        transforms=None
     )
-    # init的時候 會偷偷多加載一筆資料 所以跑完總共會載入 1 + 2 + 2 = 5 筆資料
-    # 可以在 dataset 的 Load case 加入 print 檢查 (一次只返回一筆資料)
     batch = data_loader.generate_train_batch()
     print("------------------------------------------------------")
     batch = data_loader.generate_train_batch()
     print("Batch generated successfully:", batch.keys())
+    print("Label (original):", batch['clinical_data_label'])
+    print("Input (dropped):", batch['clinical_data_aug'])
+    print("Mask (unchanged):", batch['clinical_mask'])
+    print("Keys:", batch['keys'])
