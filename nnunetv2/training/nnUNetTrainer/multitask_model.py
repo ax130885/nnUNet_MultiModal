@@ -75,7 +75,7 @@ class MyMultiModel(nn.Module):
                  input_channels: int = 1,
                  num_classes: int = 2,
                  deep_supervision: bool = True,
-                 clinical_csv_dir: str = '/home/admin/yuxin/data/Lab/model/UNet_base/nnunet_ins_data/data_test/nnUNet_raw/Dataset101/crcCTlist.csv'):
+                 clinical_csv_dir: str = '/home/admin/yuxin/data/Lab/model/UNet_base/nnunet_ins_data/data_test/nnUNet_raw/Dataset101'):
         super().__init__()
         self.input_channels = input_channels
         self.num_classes = num_classes
@@ -183,7 +183,7 @@ class MyMultiModel(nn.Module):
         # 上採樣層
         self.transpconvs.append(nn.ConvTranspose3d(320, 320, kernel_size=[1,2,2], stride=[1,2,2]))
         # (上採樣結果 concate 跳躍連接) 降維
-        self.decoder_stages.append(self._create_conv_block(320*2, 320, kernel_size=3, stride=1, num_convs=2))
+        self.decoder_stages.append(self._create_conv_block(320*3, 320, kernel_size=3, stride=1, num_convs=2))
         # 用於深度監督的分割頭
         self.seg_layers.append(nn.Conv3d(320, self.num_classes, kernel_size=1))
         # 深度監督的臨床資料預測頭
@@ -191,26 +191,26 @@ class MyMultiModel(nn.Module):
 
         # 解碼器階段 1 (對應編碼器階段4->3)
         self.transpconvs.append(nn.ConvTranspose3d(320, 256, kernel_size=2, stride=2))
-        self.decoder_stages.append(self._create_conv_block(256*2, 256, kernel_size=3, stride=1, num_convs=2))
+        self.decoder_stages.append(self._create_conv_block(256*3, 256, kernel_size=3, stride=1, num_convs=2))
         self.seg_layers.append(nn.Conv3d(256, num_classes, kernel_size=1))
         self.cli_layers.append(self._create_cli_predictor(256))
 
 
         # 解碼器階段 2 (對應編碼器階段3->2)
         self.transpconvs.append(nn.ConvTranspose3d(256, 128, kernel_size=2, stride=2))
-        self.decoder_stages.append(self._create_conv_block(128*2, 128, kernel_size=3, stride=1, num_convs=2))
+        self.decoder_stages.append(self._create_conv_block(128*3, 128, kernel_size=3, stride=1, num_convs=2))
         self.seg_layers.append(nn.Conv3d(128, num_classes, kernel_size=1))
         self.cli_layers.append(self._create_cli_predictor(128))
 
         # 解碼器階段 3 (對應編碼器階段2->1)        
         self.transpconvs.append(nn.ConvTranspose3d(128, 64, kernel_size=2, stride=2))
-        self.decoder_stages.append(self._create_conv_block(64*2, 64, kernel_size=3, stride=1, num_convs=2))
+        self.decoder_stages.append(self._create_conv_block(64*3, 64, kernel_size=3, stride=1, num_convs=2))
         self.seg_layers.append(nn.Conv3d(64, num_classes, kernel_size=1))
         self.cli_layers.append(self._create_cli_predictor(64))
 
         # 解碼器階段 4 (對應編碼器階段1->0)        
         self.transpconvs.append(nn.ConvTranspose3d(64, 32, kernel_size=2, stride=2))
-        self.decoder_stages.append(self._create_conv_block(32*2, 32, kernel_size=3, stride=1, num_convs=2))
+        self.decoder_stages.append(self._create_conv_block(32*3, 32, kernel_size=3, stride=1, num_convs=2))
         self.seg_layers.append(nn.Conv3d(32, num_classes, kernel_size=1))
         self.cli_layers.append(self._create_cli_predictor(32))
 
@@ -303,7 +303,6 @@ class MyMultiModel(nn.Module):
             fused_skip = self.multiscale_fusions[i](skip, clinical_feat)
             fused_skips.append(fused_skip)
 
-
         # ---------- 解碼器 ----------
         lres = fused_skips[-1] # 解碼器輸入
         seg_out = [] # 分割頭輸出 影像
@@ -321,10 +320,18 @@ class MyMultiModel(nn.Module):
             # 2. 拼接跳躍連接與上採樣結果 (此處的跳躍連結=影像編碼+臨床編碼的門控融合結果)
             # 注意: 跳躍連接索引是從後往前取
             # print(f"lres shape: {lres.shape}, skip shape: {skips[-(i+2)].shape}")  # 調試輸出
-            skip_to_concat = fused_skips[-(i+2)]  # 從-2開始 下次-3...，跳過瓶頸層
-            lres = torch.cat((lres, skip_to_concat), dim=1)
+            # 2.1 原版 直接拚跳躍連接和上採樣結果
             # skip = skips[-(i+2)]  # 從-2開始 下次-3...，跳過瓶頸層
             # lres = torch.cat((lres, skip), dim=1)
+
+            # 2.2 拼接門控融合後的跳躍連接和上採樣結果
+            # skip_to_concat = fused_skips[-(i+2)]  # 從-2開始 下次-3...，跳過瓶頸層
+            # lres = torch.cat((lres, skip_to_concat), dim=1)
+
+            # 2.3 拼接門控結果 原始跳躍連接 上採樣結果
+            skip_to_concat = fused_skips[-(i+2)]  # 從-2開始 下次-3...，跳過瓶頸層
+            skip = skips[-(i+2)]
+            lres = torch.cat((lres, skip_to_concat, skip), dim=1)
 
             # 3. 使用conv 對拼接後的embedding 上採樣
             lres = self.decoder_stages[i](lres)
