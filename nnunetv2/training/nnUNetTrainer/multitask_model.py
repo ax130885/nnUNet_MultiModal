@@ -92,14 +92,14 @@ class MyMultiModel(nn.Module):
         # 讀取臨床資料的類別數
         self.num_location_classes = encoder.num_location_classes # 8
         self.num_t_stage_classes = encoder.num_t_stage_classes # 6
-        self.num_n_stage_classes = encoder.num_n_stage_classes # 4
-        self.num_m_stage_classes = encoder.num_m_stage_classes # 3
+        # self.num_n_stage_classes = encoder.num_n_stage_classes # 4
+        # self.num_m_stage_classes = encoder.num_m_stage_classes # 3
 
         # 讀取臨床資料的缺失idx
         self.missing_flag_location = encoder.missing_flag_location # 7
         self.missing_flag_t_stage = encoder.missing_flag_t_stage # 5
-        self.missing_flag_n_stage = encoder.missing_flag_n_stage # 3
-        self.missing_flag_m_stage = encoder.missing_flag_m_stage # 2
+        # self.missing_flag_n_stage = encoder.missing_flag_n_stage # 3
+        # self.missing_flag_m_stage = encoder.missing_flag_m_stage # 2
 
         # ---------- 影像編碼器 ----------
         self.encoder_stages = nn.ModuleList()
@@ -151,12 +151,18 @@ class MyMultiModel(nn.Module):
         # padding_idx 確保缺失值的嵌入向量為零
         self.emb_loc = nn.Embedding(self.num_location_classes, 8, padding_idx=self.missing_flag_location)
         self.emb_t   = nn.Embedding(self.num_t_stage_classes, 8, padding_idx=self.missing_flag_t_stage)
-        self.emb_n   = nn.Embedding(self.num_n_stage_classes, 8, padding_idx=self.missing_flag_n_stage)
-        self.emb_m   = nn.Embedding(self.num_m_stage_classes, 8, padding_idx=self.missing_flag_m_stage)
+        # self.emb_n   = nn.Embedding(self.num_n_stage_classes, 8, padding_idx=self.missing_flag_n_stage)
+        # self.emb_m   = nn.Embedding(self.num_m_stage_classes, 8, padding_idx=self.missing_flag_m_stage)
 
+        # # 臨床特徵投影層，將所有embedding concate 後(dim=8*4)投影到與影像瓶頸層(dim=320)相同的通道數
+        # self.clinical_expand = nn.Sequential(
+        #     nn.Linear(8 * 4, 256), # 8是每個嵌入的維度，4是臨床特徵的數量
+        #     nn.LeakyReLU(inplace=True),
+        #     nn.Linear(256, 320) # 輸出維度與影像編碼器瓶頸層通道數一致
+        # )
         # 臨床特徵投影層，將所有embedding concate 後(dim=8*4)投影到與影像瓶頸層(dim=320)相同的通道數
         self.clinical_expand = nn.Sequential(
-            nn.Linear(8 * 4, 256), # 8是每個嵌入的維度，4是臨床特徵的數量
+            nn.Linear(8 * 2, 256), # 8是每個嵌入的維度，2是臨床特徵的數量
             nn.LeakyReLU(inplace=True),
             nn.Linear(256, 320) # 輸出維度與影像編碼器瓶頸層通道數一致
         )
@@ -217,8 +223,8 @@ class MyMultiModel(nn.Module):
         # 分類頭
         self.loc_head = nn.Linear(128, self.missing_flag_location)  # 輸出所有類別（不包括Missing對應的索引）
         self.t_head   = nn.Linear(128, self.missing_flag_t_stage)
-        self.n_head   = nn.Linear(128, self.missing_flag_n_stage)
-        self.m_head   = nn.Linear(128, self.missing_flag_m_stage)
+        # self.n_head   = nn.Linear(128, self.missing_flag_n_stage)
+        # self.m_head   = nn.Linear(128, self.missing_flag_m_stage)
 
         # 初始化權重
         self.apply(self._init_weights)
@@ -256,7 +262,7 @@ class MyMultiModel(nn.Module):
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
 
-    def forward(self, img, loc, t, n, m):
+    def forward(self, img, loc, t, n=None, m=None):
         """
         Args: 輸入模型時 需要全部為 tensor
             img:          [B, C, D, H, W]
@@ -287,13 +293,18 @@ class MyMultiModel(nn.Module):
             i += 1
         bottleneck = skips[-1]
 
+        # # ---------- 臨床 Embedding ----------
+        # loc_emb = self.emb_loc(loc) # [B] -> [B, C=8]
+        # t_emb   = self.emb_t(t)
+        # n_emb   = self.emb_n(n)
+        # m_emb   = self.emb_m(m)
+        # clinical_vec = torch.cat([loc_emb, t_emb, n_emb, m_emb], dim=1) # [B, C=8] -> [B, 8*4]
+        # clinical_feat = self.clinical_expand(clinical_vec) # [B, 8*4] -> [B, 320] (符合瓶頸層維度)
         # ---------- 臨床 Embedding ----------
         loc_emb = self.emb_loc(loc) # [B] -> [B, C=8]
         t_emb   = self.emb_t(t)
-        n_emb   = self.emb_n(n)
-        m_emb   = self.emb_m(m)
-        clinical_vec = torch.cat([loc_emb, t_emb, n_emb, m_emb], dim=1) # [B, C=8] -> [B, 8*4]
-        clinical_feat = self.clinical_expand(clinical_vec) # [B, 8*4] -> [B, 320] (符合瓶頸層維度)
+        clinical_vec = torch.cat([loc_emb, t_emb], dim=1) # [B, C=8] -> [B, 8*2]
+        clinical_feat = self.clinical_expand(clinical_vec) # [B, 8*2] -> [B, 320] (符合瓶頸層維度)
 
         # ---------- 門控融合 ----------
         fused_skips = []
@@ -309,8 +320,8 @@ class MyMultiModel(nn.Module):
 
         loc_out = [] # 分類頭輸出 位置
         t_out = []   # 分類頭輸出 時間
-        n_out = []   # 分類頭輸出 數量
-        m_out = []   # 分類頭輸出 模式
+        # n_out = []   # 分類頭輸出 數量
+        # m_out = []   # 分類頭輸出 模式
 
         # 遍歷所有解碼器階段
         for i in range(len(self.decoder_stages)):
@@ -345,8 +356,8 @@ class MyMultiModel(nn.Module):
                 # 臨床資料分類頭
                 loc_out.append(self.loc_head(cli_raw_out))
                 t_out.append(self.t_head(cli_raw_out))
-                n_out.append(self.n_head(cli_raw_out))
-                m_out.append(self.m_head(cli_raw_out))
+                # n_out.append(self.n_head(cli_raw_out))
+                # m_out.append(self.m_head(cli_raw_out))
 
             # 如果關閉深度監督 但是最後一層解碼器 還是要輸出
             elif i == (len(self.decoder_stages) - 1):
@@ -357,22 +368,22 @@ class MyMultiModel(nn.Module):
                 # 臨床資料分類頭
                 loc_out.append(self.loc_head(cli_raw_out))
                 t_out.append(self.t_head(cli_raw_out))
-                n_out.append(self.n_head(cli_raw_out))
-                m_out.append(self.m_head(cli_raw_out))
+                # n_out.append(self.n_head(cli_raw_out))
+                # m_out.append(self.m_head(cli_raw_out))
 
         # 反轉輸出順序
         seg_out = seg_out[::-1] #[start, end, step]
         loc_out = loc_out[::-1]
         t_out = t_out[::-1]
-        n_out = n_out[::-1]
-        m_out = m_out[::-1]
+        # n_out = n_out[::-1]
+        # m_out = m_out[::-1]
 
         # ---------- 屬性預測 ----------
         cli_out = {
             'location': loc_out, # loc_out[0] = [B, C=6]  (若啟動深度監督會有5個解析度的輸出)
             't_stage':  t_out,   # t_out[0] = [B, C=5]
-            'n_stage':  n_out,   # n_out[0] = [B, C=3]
-            'm_stage':  m_out    # m_out[0] = [B, C=2]
+            # 'n_stage':  n_out,   # n_out[0] = [B, C=3]
+            # 'm_stage':  m_out    # m_out[0] = [B, C=2]
         }
 
         # 如果關閉深度監督 只返回最後一層的輸出 (已經在前面設定 不用在這裡判斷是否啟用)
@@ -390,15 +401,15 @@ if __name__ == "__main__":
     img = torch.randn(2, 1, 64, 64, 64).to(device)          # B C D H W
     loc = torch.tensor([5, 2]).to(device)  # B 1，batch 1 輸入 5，batch 2 輸入 2
     t = torch.tensor([3, 1]).to(device)    # B 1，batch 1 輸入 3，batch 2 輸入 1
-    n = torch.tensor([2, 0]).to(device)    # B 1，batch 1 輸入 2，batch 2 輸入 0
-    m = torch.tensor([1, 0]).to(device)    # B 1，batch 1 輸入 1，batch 2 輸入 0
+    # n = torch.tensor([2, 0]).to(device)    # B 1，batch 1 輸入 2，batch 2 輸入 0
+    # m = torch.tensor([1, 0]).to(device)    # B 1，batch 1 輸入 1，batch 2 輸入 0
 
     # 假 GT（分割與臨床標籤都用 0/1 隨便填）
     seg_gt = torch.randint(0, 2, (2, 64, 64, 64)).long().to(device)  # 與最終層同空間尺寸
     loc_gt = torch.randint(0, model.missing_flag_location, (2,)).to(device)
     t_gt   = torch.randint(0, model.missing_flag_t_stage,   (2,)).to(device)
-    n_gt   = torch.randint(0, model.missing_flag_n_stage,   (2,)).to(device)
-    m_gt   = torch.randint(0, model.missing_flag_m_stage,   (2,)).to(device)
+    # n_gt   = torch.randint(0, model.missing_flag_n_stage,   (2,)).to(device)
+    # m_gt   = torch.randint(0, model.missing_flag_m_stage,   (2,)).to(device)
 
     # -------------------- loss & optimizer --------------------
     seg_criterion = nn.CrossEntropyLoss()
@@ -410,7 +421,8 @@ if __name__ == "__main__":
     for epoch in range(1, epochs+1):
         optimizer.zero_grad()
 
-        seg_out, cli_out = model(img, loc, t, n, m)  # 前向傳播
+        # seg_out, cli_out = model(img, loc, t, n, m)  # 前向傳播
+        seg_out, cli_out = model(img, loc, t)  # 前向傳播
 
         # 分割 loss：取最後一層（關閉 deep_supervision 時）
         if isinstance(seg_out, list):
@@ -421,10 +433,11 @@ if __name__ == "__main__":
         # 臨床 loss：取最後一層預測
         loc_loss = cls_criterion(cli_out['location'][-1], loc_gt)
         t_loss   = cls_criterion(cli_out['t_stage'][-1],   t_gt)
-        n_loss   = cls_criterion(cli_out['n_stage'][-1],   n_gt)
-        m_loss   = cls_criterion(cli_out['m_stage'][-1],   m_gt)
+        # n_loss   = cls_criterion(cli_out['n_stage'][-1],   n_gt)
+        # m_loss   = cls_criterion(cli_out['m_stage'][-1],   m_gt)
 
-        loss = seg_loss + loc_loss + t_loss + n_loss + m_loss
+        # loss = seg_loss + loc_loss + t_loss + n_loss + m_loss
+        loss = seg_loss + loc_loss + t_loss
         loss.backward()
         optimizer.step()
 
@@ -433,7 +446,8 @@ if __name__ == "__main__":
     # -------------------- 推論示範 --------------------
     with torch.no_grad():
         model.eval()
-        seg_out, cli_out = model(img, loc, t, n, m)  # 前向傳播
+        # seg_out, cli_out = model(img, loc, t, n, m)  # 前向傳播
+        seg_out, cli_out = model(img, loc, t)  # 前向傳播
         print("\n=== eval shapes ===")
         for seg in (seg_out if isinstance(seg_out, list) else [seg_out]):
             print("seg:", seg.shape)
