@@ -102,8 +102,8 @@ class nnUNetLoggerMultimodal(nnUNetLogger):
         # ax = ax_all[3]
         ax.plot(x_values, self.my_fantastic_logging['val_loc_accs'][:epoch + 1], color='purple', ls='-', label="Loc Acc", linewidth=3)
         ax.plot(x_values, self.my_fantastic_logging['val_t_accs'][:epoch + 1], color='orange', ls='--', label="T Acc", linewidth=3)
-        # ax.plot(x_values, self.my_fantastic_logging['val_n_accs'][:epoch + 1], color='brown', ls='-.', label="N Acc", linewidth=3)
-        # ax.plot(x_values, self.my_fantastic_logging['val_m_accs'][:epoch + 1], color='pink', ls=':', label="M Acc", linewidth=3)
+        ax.plot(x_values, self.my_fantastic_logging['val_n_accs'][:epoch + 1], color='brown', ls='-.', label="N Acc", linewidth=3)
+        ax.plot(x_values, self.my_fantastic_logging['val_m_accs'][:epoch + 1], color='pink', ls=':', label="M Acc", linewidth=3)
         ax.set_xlabel("epoch")
         ax.set_ylabel("Clinical Accuracy")
         ax.legend(loc=(0, 1))

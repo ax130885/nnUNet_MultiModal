@@ -1348,7 +1348,8 @@ def predict_entry_point_multimodal():
         verbose=args.verbose,
         verbose_preprocessing=args.verbose,
         allow_tqdm=not args.disable_progress_bar,
-        clinical_data_dir=args.clinical_data_dir
+        clinical_data_dir=args.clinical_data_dir,
+        no_use_input_cli_data=args.no_use_input_cli_data
     )
 
     predictor.initialize_from_trained_model_folder(
