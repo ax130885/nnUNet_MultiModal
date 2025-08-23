@@ -22,20 +22,20 @@ class nnUNetLoggerMultimodal(nnUNetLogger):
             'train_seg_losses': list(),
             'train_loc_losses': list(),
             'train_t_losses': list(),
-            # 'train_n_losses': list(),
-            # 'train_m_losses': list(),
+            'train_n_losses': list(),
+            'train_m_losses': list(),
 
             'val_total_losses': list(),
             'val_seg_losses': list(),
             'val_loc_losses': list(),
             'val_t_losses': list(),
-            # 'val_n_losses': list(),
-            # 'val_m_losses': list(),
+            'val_n_losses': list(),
+            'val_m_losses': list(),
 
             'val_loc_accs': list(),
             'val_t_accs': list(),
-            # 'val_n_accs': list(),
-            # 'val_m_accs': list(),
+            'val_n_accs': list(),
+            'val_m_accs': list(),
         })
 
 
@@ -74,8 +74,8 @@ class nnUNetLoggerMultimodal(nnUNetLogger):
         ax.set_title("Segmentation Loss and Dice")
 
         # --- 2. 臨床分類損失與指標（合併在5張子圖中）---
-        # loss_names = ['loc', 't', 'n', 'm']
-        loss_names = ['loc', 't']
+        loss_names = ['loc', 't', 'n', 'm']
+        # loss_names = ['loc', 't']
         for i, loss_name in enumerate(loss_names):
             ax = ax_all[1+i] # ax_all[1] 到 ax_all[4] 分別對應 loc, t, n, m 的損失+準確度
             ax2 = ax.twinx()
@@ -98,8 +98,8 @@ class nnUNetLoggerMultimodal(nnUNetLogger):
             ax2.set_ylim(0, 1)  # 準確度範圍 0～1
 
         # --- 3. 臨床分類準確度 ---
-        # ax = ax_all[5]
-        ax = ax_all[3]
+        ax = ax_all[5]
+        # ax = ax_all[3]
         ax.plot(x_values, self.my_fantastic_logging['val_loc_accs'][:epoch + 1], color='purple', ls='-', label="Loc Acc", linewidth=3)
         ax.plot(x_values, self.my_fantastic_logging['val_t_accs'][:epoch + 1], color='orange', ls='--', label="T Acc", linewidth=3)
         # ax.plot(x_values, self.my_fantastic_logging['val_n_accs'][:epoch + 1], color='brown', ls='-.', label="N Acc", linewidth=3)
@@ -111,8 +111,8 @@ class nnUNetLoggerMultimodal(nnUNetLogger):
         ax.set_title("Clinical Classification Accuracies")
 
         # --- 4. Epoch 耗時 ---
-        # ax = ax_all[6]
-        ax = ax_all[4]
+        ax = ax_all[6]
+        # ax = ax_all[4]
         ax.plot(x_values, [i - j for i, j in zip(self.my_fantastic_logging['epoch_end_timestamps'][:epoch + 1],
                                                 self.my_fantastic_logging['epoch_start_timestamps'])][:epoch + 1], color='b',
                 ls='-', label="epoch duration", linewidth=4)
@@ -122,8 +122,8 @@ class nnUNetLoggerMultimodal(nnUNetLogger):
         ax.set_title("Epoch Duration")
 
         # --- 5. 學習率 ---
-        # ax = ax_all[7]
-        ax = ax_all[5]
+        ax = ax_all[7]
+        # ax = ax_all[5]
         ax.plot(x_values, self.my_fantastic_logging['lrs'][:epoch + 1], color='b', ls='-', label="learning rate", linewidth=4)
         ax.set_xlabel("epoch")
         ax.set_ylabel("learning rate")

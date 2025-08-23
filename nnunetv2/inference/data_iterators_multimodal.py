@@ -339,57 +339,57 @@ def preprocessing_iterator_fromfiles_multimodal(list_of_lists: List[List[str]],
     [p.join() for p in processes]
 
 
-# if __name__ == "__main__":
-#     from nnunetv2.utilities.plans_handling.plans_handler import PlansManager, ConfigurationManager
-#     from batchgenerators.utilities.file_and_folder_operations import load_json
+if __name__ == "__main__":
+    from nnunetv2.utilities.plans_handling.plans_handler import PlansManager, ConfigurationManager
+    from batchgenerators.utilities.file_and_folder_operations import load_json
 
-#     plans = load_json("/mnt/data1/graduate/yuxin/Lab/model/UNet_base/nnunet_ins_data/data_test/nnUNet_results/Dataset101/nnUNetTrainerMultimodal__nnUNetPlans__3d_fullres/plans.json")
-#     plans_manager = PlansManager(plans)
-#     configuration_manager = plans_manager.get_configuration("3d_fullres")
-#     dataset_json = {
-#         "name": "NTUH_Colon",
-#         "description": "NTUH Colon Cancer segmentation",
-#         "reference": "NTUH",
-#         "tensorImageSize": "3D",
-#         "labels": {
-#             "background": 0,
-#             "colon cancer primaries": 1
-#         },
-#         "numTraining": 189,
-#         "numTest": 22,
-#         "file_ending": ".nii.gz",
-#         "channel_names": {
-#             "0": "CT"
-#         }
-#     }
+    plans = load_json("/mnt/data1/graduate/yuxin/Lab/model/UNet_base/nnunet_ins_data/data_test/nnUNet_results/Dataset101/nnUNetTrainerMultimodal__nnUNetPlans__3d_fullres/plans.json")
+    plans_manager = PlansManager(plans)
+    configuration_manager = plans_manager.get_configuration("3d_fullres")
+    dataset_json = {
+        "name": "NTUH_Colon",
+        "description": "NTUH Colon Cancer segmentation",
+        "reference": "NTUH",
+        "tensorImageSize": "3D",
+        "labels": {
+            "background": 0,
+            "colon cancer primaries": 1
+        },
+        "numTraining": 189,
+        "numTest": 22,
+        "file_ending": ".nii.gz",
+        "channel_names": {
+            "0": "CT"
+        }
+    }
 
-#     # 直接呼叫，不用 queue/event
-#     result = []
-#     def fake_put(item, timeout=None):
-#         print("put item:", item.keys())
-#         result.append(item)
-#     class FakeQueue:
-#         def put(self, item, timeout=None):
-#             fake_put(item, timeout)
-#     class FakeEvent:
-#         def set(self): pass
-#         def is_set(self): return False
+    # 直接呼叫，不用 queue/event
+    result = []
+    def fake_put(item, timeout=None):
+        print("put item:", item.keys())
+        result.append(item)
+    class FakeQueue:
+        def put(self, item, timeout=None):
+            fake_put(item, timeout)
+    class FakeEvent:
+        def set(self): pass
+        def is_set(self): return False
 
-#     preprocess_fromfiles_save_to_queue_multimodal(
-#         list_of_lists=[["/mnt/data1/graduate/yuxin/Lab/model/UNet_base/nnunet_ins_data/data_test/nnUNet_raw/Dataset101/imagesTs/colon_266_0000.nii.gz"],
-#                        ["/mnt/data1/graduate/yuxin/Lab/model/UNet_base/nnunet_ins_data/data_test/nnUNet_raw/Dataset101/imagesTs/colon_267_0000.nii.gz"]],
-#         list_of_segs_from_prev_stage_files=None,
-#         output_filenames_truncated=None,
-#         plans_manager=plans_manager,
-#         dataset_json=dataset_json,
-#         configuration_manager=configuration_manager,
-#         target_queue=FakeQueue(),
-#         done_event=FakeEvent(),
-#         abort_event=FakeEvent(),
-#         verbose=True,
-#         clinical_data_dir="/mnt/data1/graduate/yuxin/Lab/model/UNet_base/nnunet_ins_data/data_test/nnUNet_raw/Dataset101"
-#     )
-#     print(f"result: {result}\n\n")
-#     print("clinical_data: \n", result[0]['clinical_data'], "\n")
-#     print("clinical_mask: \n", result[0]['clinical_mask'], "\n")
-#     print("data_properties: \n", result[0]['properties'], "\n")
+    preprocess_fromfiles_save_to_queue_multimodal(
+        list_of_lists=[["/mnt/data1/graduate/yuxin/Lab/model/UNet_base/nnunet_ins_data/data_test/nnUNet_raw/Dataset101/imagesTs/colon_266_0000.nii.gz"],
+                       ["/mnt/data1/graduate/yuxin/Lab/model/UNet_base/nnunet_ins_data/data_test/nnUNet_raw/Dataset101/imagesTs/colon_267_0000.nii.gz"]],
+        list_of_segs_from_prev_stage_files=None,
+        output_filenames_truncated=None,
+        plans_manager=plans_manager,
+        dataset_json=dataset_json,
+        configuration_manager=configuration_manager,
+        target_queue=FakeQueue(),
+        done_event=FakeEvent(),
+        abort_event=FakeEvent(),
+        verbose=True,
+        clinical_data_dir="/mnt/data1/graduate/yuxin/Lab/model/UNet_base/nnunet_ins_data/data_test/nnUNet_raw/Dataset101"
+    )
+    print(f"result: {result}\n\n")
+    print("clinical_data: \n", result[0]['clinical_data'], "\n")
+    print("clinical_mask: \n", result[0]['clinical_mask'], "\n")
+    print("data_properties: \n", result[0]['properties'], "\n")

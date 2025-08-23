@@ -70,7 +70,7 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
                  verbose_preprocessing: bool = False, # 是否輸出預處理詳細日誌
                  allow_tqdm: bool = True,     # 是否允許顯示進度條
                  clinical_data_dir: str = None,
-                 no_use_input_cli_data: bool = False): # 推論時 不輸入臨床資料
+                 no_use_input_cli_data: bool = False): # 推論時 不輸入臨床資料):
         super().__init__(tile_step_size, use_gaussian, use_mirroring,
                          perform_everything_on_device, device, verbose,
                          verbose_preprocessing, allow_tqdm)
@@ -79,6 +79,7 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
         self.missing_flags = None
         self.clinical_data_dir = clinical_data_dir  # 新增臨床數據目錄參數
         self.no_use_input_cli_data = no_use_input_cli_data  # 推論時不輸入臨床資料
+
 
         print("nnUNetPredictorMultimodal 初始化完成。")
 
@@ -202,51 +203,51 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
                     # 獲取最大概率的類別索引
                     loc_idx = int(torch.argmax(clinical_attr_preds['location']).item())
                     t_idx = int(torch.argmax(clinical_attr_preds['t_stage']).item())
-                    # n_idx = int(torch.argmax(clinical_attr_preds['n_stage']).item())
-                    # m_idx = int(torch.argmax(clinical_attr_preds['m_stage']).item())
+                    n_idx = int(torch.argmax(clinical_attr_preds['n_stage']).item())
+                    m_idx = int(torch.argmax(clinical_attr_preds['m_stage']).item())
                     
                     # 計算各特徵的分布概率，用於多樣性檢查
                     loc_probs = torch.softmax(clinical_attr_preds['location'], dim=0).cpu().numpy()
                     t_probs = torch.softmax(clinical_attr_preds['t_stage'], dim=0).cpu().numpy()
-                    # n_probs = torch.softmax(clinical_attr_preds['n_stage'], dim=0).cpu().numpy()
-                    # m_probs = torch.softmax(clinical_attr_preds['m_stage'], dim=0).cpu().numpy()
+                    n_probs = torch.softmax(clinical_attr_preds['n_stage'], dim=0).cpu().numpy()
+                    m_probs = torch.softmax(clinical_attr_preds['m_stage'], dim=0).cpu().numpy()
                     
                     # 檢查預測的多樣性 - 如果最高概率低於閾值，可能表示模型不確定
                     loc_uncertain = np.max(loc_probs) < 0.7
                     t_uncertain = np.max(t_probs) < 0.7
-                    # n_uncertain = np.max(n_probs) < 0.7
-                    # m_uncertain = np.max(m_probs) < 0.7
+                    n_uncertain = np.max(n_probs) < 0.7
+                    m_uncertain = np.max(m_probs) < 0.7
                     
                     # 記錄原始索引和缺失值標記
                     loc_missing_idx = self.missing_flags.get('location')
                     t_missing_idx = self.missing_flags.get('t_stage')
-                    # n_missing_idx = self.missing_flags.get('n_stage')
-                    # m_missing_idx = self.missing_flags.get('m_stage')
+                    n_missing_idx = self.missing_flags.get('n_stage')
+                    m_missing_idx = self.missing_flags.get('m_stage')
                     
                     # 如果 missing_flag 為 True 或特徵索引等於缺失值索引，則標記為 "Missing"
                     loc_label = "Missing" if (missing_flags[0] or loc_idx == loc_missing_idx) else self.reverse_mappings['location'].get(loc_idx, 'Unknown')
                     t_label = "Missing" if (missing_flags[1] or t_idx == t_missing_idx) else self.reverse_mappings['t_stage'].get(t_idx, 'Unknown')
-                    # n_label = "Missing" if (missing_flags[2] or n_idx == n_missing_idx) else self.reverse_mappings['n_stage'].get(n_idx, 'Unknown')
-                    # m_label = "Missing" if (missing_flags[3] or m_idx == m_missing_idx) else self.reverse_mappings['m_stage'].get(m_idx, 'Unknown')
+                    n_label = "Missing" if (missing_flags[2] or n_idx == n_missing_idx) else self.reverse_mappings['n_stage'].get(n_idx, 'Unknown')
+                    m_label = "Missing" if (missing_flags[3] or m_idx == m_missing_idx) else self.reverse_mappings['m_stage'].get(m_idx, 'Unknown')
                     
                     # 組織最終結果
                     labels = {
                         "Case_Index": "",  # 會在外部設置
                         "Location": loc_label,
                         "T_stage": t_label,
-                        # "N_stage": n_label,
-                        # "M_stage": m_label,
+                        "N_stage": n_label,
+                        "M_stage": m_label,
                         "Missing_flags": missing_flags,
                         # 添加額外診斷資訊以便分析
                         "Debug_Info": {
                             "loc_probs": loc_probs.tolist(),
                             "t_probs": t_probs.tolist(),
-                            # "n_probs": n_probs.tolist(),
-                            # "m_probs": m_probs.tolist(),
+                            "n_probs": n_probs.tolist(),
+                            "m_probs": m_probs.tolist(),
                             "loc_uncertain": loc_uncertain,
                             "t_uncertain": t_uncertain,
-                            # "n_uncertain": n_uncertain,
-                            # "m_uncertain": m_uncertain,
+                            "n_uncertain": n_uncertain,
+                            "m_uncertain": m_uncertain,
                         }
                     }
                     
@@ -257,8 +258,8 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
                         "Case_Index": "",
                         "Location": "Unknown",
                         "T_stage": "Unknown",
-                        # "N_stage": "Unknown",
-                        # "M_stage": "Unknown",
+                        "N_stage": "Unknown",
+                        "M_stage": "Unknown",
                         "Missing_flags": [False, False, False, False]
                     }
             else:
@@ -267,8 +268,8 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
                     "Case_Index": "",
                     "Location": "Unknown",
                     "T_stage": "Unknown",
-                    # "N_stage": "Unknown",
-                    # "M_stage": "Unknown",
+                    "N_stage": "Unknown",
+                    "M_stage": "Unknown",
                     "Missing_flags": [False, False, False, False]
                 }
                 
@@ -304,8 +305,8 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
             class_counts = {
                 'Location': {},
                 'T_stage': {},
-                # 'N_stage': {},
-                # 'M_stage': {},
+                'N_stage': {},
+                'M_stage': {},
             }
             
             # 計算每個類別的出現次數
@@ -392,13 +393,15 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
                     clinical_features = {
                         'location': torch.tensor([self.missing_flags['location']], dtype=torch.long),
                         't_stage': torch.tensor([self.missing_flags['t_stage']], dtype=torch.long),
+                        'n_stage': torch.tensor([self.missing_flags['n_stage']], dtype=torch.long),
+                        'm_stage': torch.tensor([self.missing_flags['m_stage']], dtype=torch.long)
                     } 
                 else:
                     clinical_features = {
                         'location': torch.tensor([clinical_data['location']], dtype=torch.long),
                         't_stage': torch.tensor([clinical_data['t_stage']], dtype=torch.long),
-                        # 'n_stage': torch.tensor([clinical_data['n_stage']], dtype=torch.long),
-                        # 'm_stage': torch.tensor([clinical_data['m_stage']], dtype=torch.long)
+                        'n_stage': torch.tensor([clinical_data['n_stage']], dtype=torch.long),
+                        'm_stage': torch.tensor([clinical_data['m_stage']], dtype=torch.long)
                     }
                 
                 # 生成是否有臨床數據的標記，用於之後的處理
@@ -543,8 +546,7 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
 
         prediction_seg = None
         # 初始化臨床屬性預測的累加器
-        # prediction_cli = {k: None for k in ['location', 't_stage', 'n_stage', 'm_stage', 'missing_flags']}
-        prediction_cli = {k: None for k in ['location', 't_stage', 'missing_flags']}
+        prediction_cli = {k: None for k in ['location', 't_stage', 'n_stage', 'm_stage', 'missing_flags']}
 
         # ensemble 用， list_of_parameters 其實是 list of 模型權重 (長度為 fold 數量)
         for params in self.list_of_parameters:
@@ -559,8 +561,8 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
                 data,
                 clinical_features['location'],
                 clinical_features['t_stage'],
-                # clinical_features['n_stage'],
-                # clinical_features['m_stage']
+                clinical_features['n_stage'],
+                clinical_features['m_stage']
             )
 
             # 累加預測結果
@@ -607,8 +609,8 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
             x,
             clinical_features['location'].to(self.device),
             clinical_features['t_stage'].to(self.device),
-            # clinical_features['n_stage'].to(self.device),
-            # clinical_features['m_stage'].to(self.device)
+            clinical_features['n_stage'].to(self.device),
+            clinical_features['m_stage'].to(self.device)
         )
 
         # 處理 deep_supervision 返回的列表
@@ -643,8 +645,8 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
                     mirrored_x,
                     clinical_features['location'].to(self.device),
                     clinical_features['t_stage'].to(self.device),
-                    # clinical_features['n_stage'].to(self.device),
-                    # clinical_features['m_stage'].to(self.device)
+                    clinical_features['n_stage'].to(self.device),
+                    clinical_features['m_stage'].to(self.device)
                 )
                 
                 # 處理 deep_supervision 返回的列表
@@ -693,8 +695,7 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
             Tuple[torch.Tensor, dict]: 分割 logits 和臨床屬性 logits 字典。
         """
         predicted_logits_seg = n_predictions = prediction_seg = gaussian = workon_image = None
-        # predicted_logits_cli = {k: None for k in ['location', 't_stage', 'n_stage', 'm_stage', 'missing_flags']}
-        predicted_logits_cli = {k: None for k in ['location', 't_stage', 'missing_flags']}
+        predicted_logits_cli = {k: None for k in ['location', 't_stage', 'n_stage', 'm_stage', 'missing_flags']}
         
         results_device = self.device if do_on_device else torch.device('cpu') # 結果儲存設備
 
@@ -750,8 +751,8 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
             cli_output_shapes = {
                 'location': (self.num_clinical_classes['location'],),  # 預設 8 個類別
                 't_stage': (self.num_clinical_classes['t_stage'],),   # 預設 6 個類別
-                # 'n_stage': (self.num_clinical_classes['n_stage'],),   # 預設 4 個類別
-                # 'm_stage': (self.num_clinical_classes['m_stage'],),   # 預設 3 個類別
+                'n_stage': (self.num_clinical_classes['n_stage'],),   # 預設 4 個類別
+                'm_stage': (self.num_clinical_classes['m_stage'],),   # 預設 3 個類別
                 'missing_flags': (4,)  # 預設 4 個標誌
             }
             
@@ -760,8 +761,8 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
                 cli_output_shapes = {
                     'location': (attr_init_kwargs.get('num_location_classes'),),
                     't_stage': (attr_init_kwargs.get('num_t_stage_classes'),),
-                    # 'n_stage': (attr_init_kwargs.get('num_n_stage_classes'),),
-                    # 'm_stage': (attr_init_kwargs.get('num_m_stage_classes'),),
+                    'n_stage': (attr_init_kwargs.get('num_n_stage_classes'),),
+                    'm_stage': (attr_init_kwargs.get('num_m_stage_classes'),),
                     'missing_flags': (attr_init_kwargs.get('missing_flags_dim'),)
                 }
             
@@ -919,7 +920,7 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
         return predicted_logits_seg, predicted_logits_cli
 
     @torch.inference_mode()
-    def predict_sliding_window_return_logits(self, data: torch.Tensor, loc: torch.Tensor, t: torch.Tensor, n: torch.Tensor = None, m: torch.Tensor = None):
+    def predict_sliding_window_return_logits(self, data: torch.Tensor, loc: torch.Tensor, t: torch.Tensor, n: torch.Tensor, m: torch.Tensor):
         """
         使用滑動窗口方法進行預測，返回原始 logits（用於驗證）。
         支持多模態數據輸入（影像 + 臨床特徵）。
@@ -938,8 +939,8 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
         clinical_features = {
             'location': loc.unsqueeze(0) if loc.dim() == 0 else loc,
             't_stage': t.unsqueeze(0) if t.dim() == 0 else t,
-            # 'n_stage': n.unsqueeze(0) if n.dim() == 0 else n,
-            # 'm_stage': m.unsqueeze(0) if m.dim() == 0 else m
+            'n_stage': n.unsqueeze(0) if n.dim() == 0 else n,
+            'm_stage': m.unsqueeze(0) if m.dim() == 0 else m
         }
         
         assert isinstance(data, torch.Tensor), "輸入影像必須是 torch.Tensor 類型。"
@@ -972,24 +973,21 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
                 clinical_features['location'] = torch.tensor([[self.missing_flags['location']]], device=self.device)
             if 't_stage' not in clinical_features or clinical_features['t_stage'] is None:
                 clinical_features['t_stage'] = torch.tensor([[self.missing_flags['t_stage']]], device=self.device)
-            # if 'n_stage' not in clinical_features or clinical_features['n_stage'] is None:
-            #     clinical_features['n_stage'] = torch.tensor([[self.missing_flags['n_stage']]], device=self.device)
-            # if 'm_stage' not in clinical_features or clinical_features['m_stage'] is None:
-            #     clinical_features['m_stage'] = torch.tensor([[self.missing_flags['m_stage']]], device=self.device)
+            if 'n_stage' not in clinical_features or clinical_features['n_stage'] is None:
+                clinical_features['n_stage'] = torch.tensor([[self.missing_flags['n_stage']]], device=self.device)
+            if 'm_stage' not in clinical_features or clinical_features['m_stage'] is None:
+                clinical_features['m_stage'] = torch.tensor([[self.missing_flags['m_stage']]], device=self.device)
 
             # 記錄哪些特徵是缺失的（用於後續的 missing_flags 處理）
             is_loc_missing = clinical_features['location'].item() == self.missing_flags['location'] if clinical_features['location'].numel() == 1 else False
             is_t_missing = clinical_features['t_stage'].item() == self.missing_flags['t_stage'] if clinical_features['t_stage'].numel() == 1 else False
-            # is_n_missing = clinical_features['n_stage'].item() == self.missing_flags['n_stage'] if clinical_features['n_stage'].numel() == 1 else False
-            # is_m_missing = clinical_features['m_stage'].item() == self.missing_flags['m_stage'] if clinical_features['m_stage'].numel() == 1 else False
+            is_n_missing = clinical_features['n_stage'].item() == self.missing_flags['n_stage'] if clinical_features['n_stage'].numel() == 1 else False
+            is_m_missing = clinical_features['m_stage'].item() == self.missing_flags['m_stage'] if clinical_features['m_stage'].numel() == 1 else False
 
             # 打印調試信息
-            # if self.verbose:
-            #     print(f"臨床特徵: loc={clinical_features['location'].item()}, t={clinical_features['t_stage'].item()}, n={clinical_features['n_stage'].item()}, m={clinical_features['m_stage'].item()}")
-            #     print(f"缺失標記: loc={is_loc_missing}, t={is_t_missing}, n={is_n_missing}, m={is_m_missing}")
             if self.verbose:
-                print(f"臨床特徵: loc={clinical_features['location'].item()}, t={clinical_features['t_stage'].item()}")
-                print(f"缺失標記: loc={is_loc_missing}, t={is_t_missing}")
+                print(f"臨床特徵: loc={clinical_features['location'].item()}, t={clinical_features['t_stage'].item()}, n={clinical_features['n_stage'].item()}, m={clinical_features['m_stage'].item()}")
+                print(f"缺失標記: loc={is_loc_missing}, t={is_t_missing}, n={is_n_missing}, m={is_m_missing}")
 
             # 確保所有特徵都在正確的設備上
             for k in clinical_features.keys():
@@ -1370,5 +1368,5 @@ def predict_entry_point_multimodal():
         folder_with_segs_from_prev_stage=args.prev_stage_predictions,
         num_parts=args.num_parts,
         part_id=args.part_id,
-        max_cases=args.max_cases,
+        max_cases=args.max_cases
     )

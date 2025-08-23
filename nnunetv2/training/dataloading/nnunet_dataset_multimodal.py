@@ -95,9 +95,6 @@ class nnUNetDatasetMultimodal(nnUNetDatasetBlosc2):
         n_idx   = row['N_stage'].values[0]
         m_idx   = row['M_stage'].values[0]
 
-
-
-
         clinical_data_dict = {
             'location': loc_idx, # [1] 純量元素
             't_stage':  t_idx,
