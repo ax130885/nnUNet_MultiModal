@@ -215,26 +215,29 @@ class MyMultiModel(nn.Module):
         )
 
 
-        # # ---------- 門控混合 跳躍連結(skip)與臨床特徵 ----------
-        # self.multiscale_fusions = nn.ModuleList([
-        #     GatedFusion(32),
-        #     GatedFusion(64),
-        #     GatedFusion(128),
-        #     GatedFusion(256),
-        #     GatedFusion(320),
-        #     GatedFusion(320)
-        # ])
-
-
-        # ---------- FiLM混合,  Feature-wise Linear Modulation 跳躍連結(skip)與臨床特徵 ----------
+        # ---------- 門控混合 跳躍連結(skip)與臨床特徵 ----------
         self.multiscale_fusions = nn.ModuleList([
-            FiLMAddFusion(32,  320),
-            FiLMAddFusion(64,  320),
-            FiLMAddFusion(128, 320),
-            FiLMAddFusion(256, 320),
-            FiLMAddFusion(320, 320),
-            FiLMAddFusion(320, 320)
+            # GatedFusion(32),
+            # GatedFusion(64),
+            # GatedFusion(128),
+            None,
+            None,
+            None,
+            GatedFusion(256),
+            GatedFusion(320),
+            GatedFusion(320)
         ])
+
+
+        # # ---------- FiLM混合,  Feature-wise Linear Modulation 跳躍連結(skip)與臨床特徵 ----------
+        # self.multiscale_fusions = nn.ModuleList([
+        #     FiLMAddFusion(32,  320),
+        #     FiLMAddFusion(64,  320),
+        #     FiLMAddFusion(128, 320),
+        #     FiLMAddFusion(256, 320),
+        #     FiLMAddFusion(320, 320),
+        #     FiLMAddFusion(320, 320)
+        # ])
 
         # ---------- 解碼器 ----------
         self.transpconvs = nn.ModuleList() # 用於上採樣的轉置卷積層
@@ -259,22 +262,22 @@ class MyMultiModel(nn.Module):
         self.seg_layers.append(nn.Conv3d(256, num_classes, kernel_size=1))
         self.cli_layers.append(self._create_cli_predictor(256))
 
-
+        mul_coef = 2
         # 解碼器階段 2 (對應編碼器階段3->2)
         self.transpconvs.append(nn.ConvTranspose3d(256, 128, kernel_size=2, stride=2))
-        self.decoder_stages.append(self._create_conv_block(128*3, 128, kernel_size=3, stride=1, num_convs=2))
+        self.decoder_stages.append(self._create_conv_block(128*mul_coef, 128, kernel_size=3, stride=1, num_convs=2))
         self.seg_layers.append(nn.Conv3d(128, num_classes, kernel_size=1))
         self.cli_layers.append(self._create_cli_predictor(128))
 
         # 解碼器階段 3 (對應編碼器階段2->1)        
         self.transpconvs.append(nn.ConvTranspose3d(128, 64, kernel_size=2, stride=2))
-        self.decoder_stages.append(self._create_conv_block(64*3, 64, kernel_size=3, stride=1, num_convs=2))
+        self.decoder_stages.append(self._create_conv_block(64*mul_coef, 64, kernel_size=3, stride=1, num_convs=2))
         self.seg_layers.append(nn.Conv3d(64, num_classes, kernel_size=1))
         self.cli_layers.append(self._create_cli_predictor(64))
 
         # 解碼器階段 4 (對應編碼器階段1->0)        
         self.transpconvs.append(nn.ConvTranspose3d(64, 32, kernel_size=2, stride=2))
-        self.decoder_stages.append(self._create_conv_block(32*3, 32, kernel_size=3, stride=1, num_convs=2))
+        self.decoder_stages.append(self._create_conv_block(32*mul_coef, 32, kernel_size=3, stride=1, num_convs=2))
         self.seg_layers.append(nn.Conv3d(32, num_classes, kernel_size=1))
         self.cli_layers.append(self._create_cli_predictor(32))
 
@@ -359,11 +362,18 @@ class MyMultiModel(nn.Module):
         clinical_vec = torch.cat([loc_emb, t_emb, n_emb, m_emb], dim=1) # [B, C=8] -> [B, 8*4]
         clinical_feat = self.clinical_expand(clinical_vec) # [B, 8*4] -> [B, 320] (符合瓶頸層維度)
 
-        # ---------- 門控融合 ----------
+        # ---------- 融合 ----------
         fused_skips = []
         for i, skip in enumerate(skips):
-            # skips = [stage0, stage1, stage2, stage3, stage4, stage5]
-            # fused_skips[i] 對應 encoder_stages[i] 的輸出
+            # # skips = [stage0, stage1, stage2, stage3, stage4, stage5]
+            # # fused_skips[i] 對應 encoder_stages[i] 的輸出
+
+            # 跳過淺層 計算門控混合的過程
+            # 只對深層(低解析度層)進行融合，淺層直接使用原始跳躍連接
+            if i < 3:  # stage0, stage1, stage2 (高解析度層)
+                fused_skips.append(None)  # 佔位，保持索引一致
+                continue
+            
             fused_skip = self.multiscale_fusions[i](skip, clinical_feat)
             fused_skips.append(fused_skip)
 
@@ -394,10 +404,20 @@ class MyMultiModel(nn.Module):
             # skip_to_concat = fused_skips[-(i+2)]  # 從-2開始 下次-3...，跳過瓶頸層
             # lres = torch.cat((lres, skip_to_concat), dim=1)
 
-            # 2.3 拼接 1.門控結果 2.原始跳躍連接 3.上採樣結果
-            skip_to_concat = fused_skips[-(i+2)]  # 從-2開始 下次-3...，跳過瓶頸層
-            skip = skips[-(i+2)]
-            lres = torch.cat((lres, skip_to_concat, skip), dim=1)
+            # # 2.3 三版 拼接 1.門控結果 2.跳躍連接 3.上採樣結果
+            # skip_to_concat = fused_skips[-(i+2)]  # 從-2開始 下次-3...，跳過瓶頸層
+            # skip = skips[-(i+2)]
+            # lres = torch.cat((lres, skip_to_concat, skip), dim=1)
+            
+
+            # 2.4 根據解析度層級選擇不同的拼接策略
+            skip = skips[-(i+2)]  # 從-2開始 下次-3...，跳過瓶頸層
+            
+            if i < 2:  # 前兩層解碼器（低解析度層）
+                skip_to_concat = fused_skips[-(i+2)]  # 使用門控融合結果
+                lres = torch.cat((lres, skip_to_concat, skip), dim=1)  # 三路拼接
+            else:  # 高解析度層
+                lres = torch.cat((lres, skip), dim=1)  # 原始nnUNet風格，二路拼接
 
 
 
