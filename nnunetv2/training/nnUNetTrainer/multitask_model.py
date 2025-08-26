@@ -39,6 +39,25 @@ class FiLMAddFusion(nn.Module):
             nn.Conv3d(channels * 2, channels, 3, padding=1),
             InstanceNorm3d(channels)
         )
+        
+        # 使用統一的初始化方法
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        """初始化權重，符合 apply 方法的參數要求"""
+        if isinstance(m, nn.Conv3d):
+            nn.init.kaiming_normal_(m.weight, nonlinearity='leaky_relu', a=0.01)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.Linear):
+            nn.init.kaiming_normal_(m.weight, nonlinearity='leaky_relu', a=0.01)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, InstanceNorm3d):
+            if m.weight is not None:
+                nn.init.constant_(m.weight, 1)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
 
     def forward(self, img_feat, cli_feat):
         """
@@ -99,6 +118,33 @@ class GatedFusion(nn.Module):
             nn.Conv3d(channels*2, channels, 3, padding=1),
             InstanceNorm3d(channels)
         )
+        
+        # 使用統一的初始化方法
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        """初始化權重，符合 apply 方法的參數要求"""
+        if isinstance(m, nn.Conv3d):
+            # 對於門控機制使用不同的初始化
+            if any(m is layer for layer in self.gate_conv):
+                # 門控層的權重初始化為接近零的值，使初始門控接近0.5
+                nn.init.normal_(m.weight, mean=0.0, std=0.01)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            else:
+                # 其他卷積層使用Kaiming初始化
+                nn.init.kaiming_normal_(m.weight, nonlinearity='leaky_relu', a=0.01)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.Linear):
+            nn.init.kaiming_normal_(m.weight, nonlinearity='leaky_relu', a=0.01)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, (InstanceNorm3d, nn.LayerNorm)):
+            if m.weight is not None:
+                nn.init.constant_(m.weight, 1)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
 
     def forward(self, img_feat, cli_feat):
         # 影像特徵投影 (conv)
@@ -217,12 +263,12 @@ class MyMultiModel(nn.Module):
 
         # ---------- 門控混合 跳躍連結(skip)與臨床特徵 ----------
         self.multiscale_fusions = nn.ModuleList([
-            # GatedFusion(32),
-            # GatedFusion(64),
-            # GatedFusion(128),
-            None,
-            None,
-            None,
+            GatedFusion(32),
+            GatedFusion(64),
+            GatedFusion(128),
+            # None,
+            # None,
+            # None,
             GatedFusion(256),
             GatedFusion(320),
             GatedFusion(320)
@@ -262,7 +308,7 @@ class MyMultiModel(nn.Module):
         self.seg_layers.append(nn.Conv3d(256, num_classes, kernel_size=1))
         self.cli_layers.append(self._create_cli_predictor(256))
 
-        mul_coef = 2
+        mul_coef = 3
         # 解碼器階段 2 (對應編碼器階段3->2)
         self.transpconvs.append(nn.ConvTranspose3d(256, 128, kernel_size=2, stride=2))
         self.decoder_stages.append(self._create_conv_block(128*mul_coef, 128, kernel_size=3, stride=1, num_convs=2))
@@ -368,11 +414,11 @@ class MyMultiModel(nn.Module):
             # # skips = [stage0, stage1, stage2, stage3, stage4, stage5]
             # # fused_skips[i] 對應 encoder_stages[i] 的輸出
 
-            # 跳過淺層 計算門控混合的過程
-            # 只對深層(低解析度層)進行融合，淺層直接使用原始跳躍連接
-            if i < 3:  # stage0, stage1, stage2 (高解析度層)
-                fused_skips.append(None)  # 佔位，保持索引一致
-                continue
+            # # 跳過淺層 計算門控混合的過程
+            # # 只對深層(低解析度層)進行融合，淺層直接使用原始跳躍連接
+            # if i < 3:  # stage0, stage1, stage2 (高解析度層)
+            #     fused_skips.append(None)  # 佔位，保持索引一致
+            #     continue
             
             fused_skip = self.multiscale_fusions[i](skip, clinical_feat)
             fused_skips.append(fused_skip)
@@ -404,20 +450,20 @@ class MyMultiModel(nn.Module):
             # skip_to_concat = fused_skips[-(i+2)]  # 從-2開始 下次-3...，跳過瓶頸層
             # lres = torch.cat((lres, skip_to_concat), dim=1)
 
-            # # 2.3 三版 拼接 1.門控結果 2.跳躍連接 3.上採樣結果
-            # skip_to_concat = fused_skips[-(i+2)]  # 從-2開始 下次-3...，跳過瓶頸層
-            # skip = skips[-(i+2)]
-            # lres = torch.cat((lres, skip_to_concat, skip), dim=1)
+            # 2.3 三版 拼接 1.門控結果 2.跳躍連接 3.上採樣結果
+            skip_to_concat = fused_skips[-(i+2)]  # 從-2開始 下次-3...，跳過瓶頸層
+            skip = skips[-(i+2)]
+            lres = torch.cat((lres, skip_to_concat, skip), dim=1)
             
 
-            # 2.4 根據解析度層級選擇不同的拼接策略
-            skip = skips[-(i+2)]  # 從-2開始 下次-3...，跳過瓶頸層
+            # # 2.4 根據解析度層級選擇不同的拼接策略
+            # skip = skips[-(i+2)]  # 從-2開始 下次-3...，跳過瓶頸層
             
-            if i < 2:  # 前兩層解碼器（低解析度層）
-                skip_to_concat = fused_skips[-(i+2)]  # 使用門控融合結果
-                lres = torch.cat((lres, skip_to_concat, skip), dim=1)  # 三路拼接
-            else:  # 高解析度層
-                lres = torch.cat((lres, skip), dim=1)  # 原始nnUNet風格，二路拼接
+            # if i < 2:  # 前兩層解碼器（低解析度層）
+            #     skip_to_concat = fused_skips[-(i+2)]  # 使用門控融合結果
+            #     lres = torch.cat((lres, skip_to_concat, skip), dim=1)  # 三路拼接
+            # else:  # 高解析度層
+            #     lres = torch.cat((lres, skip), dim=1)  # 原始nnUNet風格，二路拼接
 
 
 
