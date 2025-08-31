@@ -50,23 +50,6 @@ import csv
 import warnings
 from time import sleep
 
-def calculate_class_weights(labels, num_classes):
-    counts = Counter(labels)
-    total = sum(counts.values())
-    weights = []
-    for i in range(num_classes):
-        count = counts.get(i, 0)
-        # 避免除以0
-        if count == 0:
-            weight = 0.0
-        else:
-            weight = total / count
-        weights.append(weight)
-    # 標準化權重到[0,1]區間(選擇性)
-    max_w = max(weights)
-    weights = [w / max_w for w in weights]
-    return weights
-
 class nnUNetTrainerMultimodal(nnUNetTrainer):
     """
     擴展 nnUNetTrainer，支援多模態數據（影像 + 臨床資料）訓練，
@@ -100,14 +83,17 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
             from nnunetv2.paths import nnUNet_preprocessed
             from nnunetv2.paths import nnUNet_raw
             self.clinical_data_dir = join(nnUNet_raw, self.plans_manager.dataset_name)
-            print(f"Dataset101 模式啟用，臨床資料路徑: {self.clinical_data_dir}")
+            if self.local_rank == 0:
+                print(f"Dataset101 模式啟用，臨床資料路徑: {self.clinical_data_dir}")
         else:
-            print("Dataset100 模式啟用，無臨床資料。")
+            if self.local_rank == 0:
+                print("Dataset100 模式啟用，無臨床資料。")
 
         # 重新初始化 Logger 為多模態版本
         self.logger = nnUNetLoggerMultimodal()
-        print(f"logger種類為: {type(self.logger)}")
-        print("nnUNetTrainerMultimodal 初始化完成。")
+        if self.local_rank == 0:
+            print(f"logger種類為: {type(self.logger)}")
+            print("nnUNetTrainerMultimodal 初始化完成。")
 
 
 
@@ -120,25 +106,63 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
             # 調用父類的 _set_batch_size_and_oversample 來處理 DDP 批次大小
             self._set_batch_size_and_oversample()
 
-            # 設置臨床損失權重的初始值
-            self.clinical_loss_weights = {
-                'location': 0.0,  # 位置分類損失權重
+            # 設置臨床損失權重的控制點
+            # 格式：{ 任務名稱: [(epoch數, 權重值), ...], ... }
+            # 控制點按 epoch 升序排列，每個任務至少需要一個控制點
+            self.clinical_loss_weight_schedule = {
+                'location': [
+                    (0, 0.1),
+                    (5, 0.2),
+                    (int(self.num_epochs * 0.3), 0.8),
+                    (self.num_epochs - 1, 2.0)
+                ],
+                't_stage': [
+                    (0, 0.075),
+                    (5, 0.15),
+                    (int(self.num_epochs * 0.3), 0.6),
+                    (self.num_epochs - 1, 1.5)
+                ],
+                'n_stage': [
+                    (0, 0.02),
+                    (5, 0.04),
+                    (int(self.num_epochs * 0.3), 0.2),
+                    (self.num_epochs - 1, 0.6)
+                ],
+                'm_stage': [
+                    (0, 0.02),
+                    (5, 0.04),
+                    (int(self.num_epochs * 0.3), 0.2),
+                    (self.num_epochs - 1, 0.6)
+                ]
+            }
+            
+            # 當前使用的權重 (初始化為初始值)
+            self.clinical_loss_manual_weights = {
+                task: schedule[0][1] for task, schedule in self.clinical_loss_weight_schedule.items()
+            }
+            
+            # 初始化 grad norm EMA
+            self.ema_grad_norm = {
+                'seg': 0.0,
+                'location': 0.0,
                 't_stage': 0.0,
                 'n_stage': 0.0,
                 'm_stage': 0.0
             }
 
-            # 設置臨床損失權重的終點
-            self.target_clinical_loss_weights = {
-                'location': 1.0,      # 位置分類損失權重最高
-                't_stage': 0.5,       # T 分期權重次之
-                'n_stage': 0.2,       # N 分期權重較低
-                'm_stage': 0.2,       # M 分期權重較低
+            # 初始化 grad norm 最終權重
+            self.grad_norm_factors = {
+                'seg': 1.0, 
+                'location': 1.0, 
+                't_stage': 1.0, 
+                'n_stage': 1.0, 
+                'm_stage': 1.0
             }
 
-            self.clinical_loss_start_epoch = 100  # 從第 100 個 epoch 開始增加權重
-            self.clinical_loss_end_epoch = self.num_epochs   # 到最後一個 epoch 達到目標權重
-
+            # grad norm 設定
+            self.ema_alpha = 0.95  # EMA 平滑係數，較高的值表示更平滑的移動平均
+            self.last_grad_norm_update_epoch = -1  # 上次更新梯度範數的 epoch
+            
             # determine_num_input_channels 會自動檢查是否是級聯模型並增加通道數
             # 不需要特殊處理，反正不會用到cascade模型 只是為了避免報錯
             from nnunetv2.utilities.label_handling.label_handling import determine_num_input_channels
@@ -157,7 +181,8 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
 
             # 編譯網路 (如果支援且啟用)
             if self._do_i_compile():
-                self.print_to_log_file('使用 torch.compile...')
+                if self.local_rank == 0:
+                    self.print_to_log_file('使用 torch.compile...')
                 self.network = torch.compile(self.network)
 
             # 配置優化器和學習率排程器
@@ -171,22 +196,17 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
             # 構建損失函數
             self.loss = self._build_loss()
             
-            # self.focal_loss = FocalLoss(gamma=2.0, reduction='mean')
-            
-
-
-            # 建立跨batch的臨床資料損失函數
-
-
             # 設定資料集類別
             # 根據是否是 Dataset101 決定使用哪個 Dataset 類別
             if self.is_stage2_dataset:
                 self.dataset_class = nnUNetDatasetMultimodal
-                print(f" Trainer 將使用 {self.dataset_class.__name__} 資料集類別。")
+                if self.local_rank == 0:
+                    print(f" Trainer 將使用 {self.dataset_class.__name__} 資料集類別。")
             else:
                 self.dataset_class = infer_dataset_class_original(self.preprocessed_dataset_folder)
-                print(f" Trainer 將使用 {self.dataset_class.__name__} 資料集類別。")
-            
+                if self.local_rank == 0:
+                    print(f" Trainer 將使用 {self.dataset_class.__name__} 資料集類別。")
+
             self.was_initialized = True
         else:
             raise RuntimeError("Trainer 已經初始化，不應重複調用 initialize。")
@@ -351,11 +371,13 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
                 missing_flag = missing_flags[col]
                 value_counts_no_missing = {k: v for k, v in value_counts.items() if k != missing_flag}
                 clinical_valid_class_counts[col] = value_counts_no_missing
-                print(f"[FocalLoss統計] {col} 各類別數量(不含missing): {value_counts_no_missing}")
+                if self.local_rank == 0:
+                    print(f"[FocalLoss統計] {col} 各類別數量(不含missing): {value_counts_no_missing}")
                 weights = {k: 1.0/(v+1e-6) for k, v in value_counts_no_missing.items()}
                 max_w = max(weights.values()) if weights else 1.0
                 weights_norm = {k: w/max_w for k, w in weights.items()}
-                print(f"[FocalLoss權重] {col} (已正規化): {weights_norm}")
+                if self.local_rank == 0:
+                    print(f"[FocalLoss權重] {col} (已正規化): {weights_norm}")
                 num_classes = num_classes_dict[col]
                 # 權重 list，順序為 0,1,...,num_classes-1，missing_flag 欄位補 0.0
                 alpha = []
@@ -365,20 +387,38 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
                     else:
                         alpha.append(weights_norm.get(i, 0.0))
                 clinical_class_weights[col] = alpha
-                print(f"[FocalLoss權重list] {col}: {alpha}")
+                if self.local_rank == 0:
+                    print(f"[FocalLoss權重list] {col}: {alpha}")
             
             
             # print("訓練集 T_stage 分布:", clinical_df_tr['T_stage'].value_counts().sort_index())
             self.clinical_class_weights = clinical_class_weights
 
-            # 建立臨床分類損失函數
+            # focal loss 臨床特徵用
             self.focal_loss_loc = FocalLoss(alpha=self.clinical_class_weights["Location"], gamma=2.0, reduction='masked_mean')
             self.focal_loss_t = FocalLoss(alpha=self.clinical_class_weights["T_stage"], gamma=2.0, reduction='masked_mean')
             self.focal_loss_n = FocalLoss(alpha=self.clinical_class_weights["N_stage"], gamma=2.0, reduction='masked_mean')
             self.focal_loss_m = FocalLoss(alpha=self.clinical_class_weights["M_stage"], gamma=2.0, reduction='masked_mean')
 
+            # ce loss 臨床特徵用
+            self.loc_weight = torch.tensor(self.clinical_class_weights["Location"], device=self.device)
+            self.t_weight = torch.tensor(self.clinical_class_weights["T_stage"], device=self.device)
+            self.n_weight = torch.tensor(self.clinical_class_weights["N_stage"], device=self.device)
+            self.m_weight = torch.tensor(self.clinical_class_weights["M_stage"], device=self.device)
+            if self.local_rank == 0:
+                print(f"Location 權重張量: {self.loc_weight}")
+                print(f"T_stage 權重張量: {self.t_weight}")
+                print(f"N_stage 權重張量: {self.n_weight}")
+                print(f"M_stage 權重張量: {self.m_weight}")
 
-            # 將focal loss 套用深度監督包裝器 (直接計算所有解析度輸出的loss)
+            # 設置交叉熵損失 (CE Loss)
+            self.ce_loss_loc = nn.CrossEntropyLoss(weight=self.loc_weight, reduction='mean')
+            self.ce_loss_t = nn.CrossEntropyLoss(weight=self.t_weight, reduction='mean')
+            self.ce_loss_n = nn.CrossEntropyLoss(weight=self.n_weight, reduction='mean')
+            self.ce_loss_m = nn.CrossEntropyLoss(weight=self.m_weight, reduction='mean')
+
+
+            # 將 focal loss 套用深度監督包裝器 (直接計算所有解析度輸出的loss)
             if self.enable_deep_supervision:
                 from nnunetv2.training.loss.deep_supervision import DeepSupervisionWrapper
                 deep_supervision_scales = self._get_deep_supervision_scales()
@@ -393,6 +433,22 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
                 self.focal_loss_n = DeepSupervisionWrapper(self.focal_loss_n, weights)
                 self.focal_loss_m = DeepSupervisionWrapper(self.focal_loss_m, weights)
 
+
+            # 將 ce loss 套用深度監督包裝器 (直接計算所有解析度輸出的loss)
+            if self.enable_deep_supervision:
+                from nnunetv2.training.loss.deep_supervision import DeepSupervisionWrapper
+                deep_supervision_scales = self._get_deep_supervision_scales()
+                weights = np.array([1 / (2 ** i) for i in range(len(deep_supervision_scales))])
+                if self.is_ddp and not self._do_i_compile():
+                    weights[-1] = 1e-6 # DDP 和 compile 的特殊處理
+                else:
+                    weights[-1] = 0
+                weights = weights / weights.sum()
+                self.ce_loss_loc = DeepSupervisionWrapper(self.ce_loss_loc, weights)
+                self.ce_loss_t = DeepSupervisionWrapper(self.ce_loss_t, weights)
+                self.ce_loss_n = DeepSupervisionWrapper(self.ce_loss_n, weights)
+                self.ce_loss_m = DeepSupervisionWrapper(self.ce_loss_m, weights)
+
         else:
             # Dataset100 不傳遞 clinical_data_dir
             # 使用 infer_dataset_class_original 確保使用正確的基礎 Dataset 類
@@ -404,9 +460,9 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
                                              folder_with_segs_from_previous_stage=self.folder_with_segs_from_previous_stage)
             dataset_val = original_dataset_class(self.preprocessed_dataset_folder, val_keys,
                                               folder_with_segs_from_previous_stage=self.folder_with_segs_from_previous_stage)
-        
-        print(f"訓練資料集載入器使用 Dataset 類別: {type(dataset_tr).__name__}")
-        print(f"驗證資料集載入器使用 Dataset 類別: {type(dataset_val).__name__}")
+        if self.local_rank == 0:
+            print(f"訓練資料集載入器使用 Dataset 類別: {type(dataset_tr).__name__}")
+            print(f"驗證資料集載入器使用 Dataset 類別: {type(dataset_val).__name__}")
         return dataset_tr, dataset_val
 
     def get_dataloaders(self):
@@ -489,6 +545,19 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
 
         return mt_gen_train, mt_gen_val
 
+
+    def on_train_epoch_start(self):
+        self.network.train()
+        # self.lr_scheduler.step()  # 在每個 epoch 開始時更新學習率
+        self.print_to_log_file('')
+        self.print_to_log_file(f'Epoch {self.current_epoch}')
+        self.print_to_log_file(
+            f"Current learning rate: {np.round(self.optimizer.param_groups[0]['lr'], decimals=5)}")
+        # lrs are the same for all workers so we don't need to gather them in case of DDP training
+        self.logger.log('lrs', self.optimizer.param_groups[0]['lr'], self.current_epoch)
+
+
+
     def train_step(self, batch: dict) -> dict:
         """
         執行一個訓練步驟，包括前向傳播、損失計算和反向傳播。
@@ -550,41 +619,144 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
              # 對於每個臨床屬性，計算 Focal Loss
             # cli_out: 預測結果, loc_label: 真實標籤 (使用原始未增強的標籤計算loss)
             if self.enable_deep_supervision:
-                loc_loss_tr = self.focal_loss_loc(
-                    cli_out['location'],           # list of tensor，每個分支一個 tensor
-                    [loc_label] * len(cli_out['location']),  # list，每個分支都用同一個 label tensor
-                    [loc_mask] * len(cli_out['location'])    # list，每個分支都用同一個 mask tensor
+                # # focal loss
+                # loc_loss_tr = self.focal_loss_loc(
+                #     cli_out['location'],           # list of tensor，每個分支一個 tensor
+                #     [loc_label] * len(cli_out['location']),  # list，每個分支都用同一個 label tensor
+                #     [loc_mask] * len(cli_out['location'])    # list，每個分支都用同一個 mask tensor
+                # )
+                # t_loss_tr = self.focal_loss_t(
+                #     cli_out['t_stage'],
+                #     [t_label] * len(cli_out['t_stage']),
+                #     [t_mask] * len(cli_out['t_stage'])
+                # )
+                # n_loss_tr = self.focal_loss_n(
+                #     cli_out['n_stage'],
+                #     [n_label] * len(cli_out['n_stage']),
+                #     [n_mask] * len(cli_out['n_stage'])
+                # )
+                # m_loss_tr = self.focal_loss_m(
+                #     cli_out['m_stage'],
+                #     [m_label] * len(cli_out['m_stage']),
+                #     [m_mask] * len(cli_out['m_stage'])
+                # )
+
+                # ce loss
+                loc_loss_tr = self.ce_loss_loc(
+                    cli_out['location'],
+                    [loc_label] * len(cli_out['location']),
                 )
-                t_loss_tr = self.focal_loss_t(
+                t_loss_tr = self.ce_loss_t(
                     cli_out['t_stage'],
                     [t_label] * len(cli_out['t_stage']),
-                    [t_mask] * len(cli_out['t_stage'])
                 )
-                n_loss_tr = self.focal_loss_n(
+                n_loss_tr = self.ce_loss_n(
                     cli_out['n_stage'],
                     [n_label] * len(cli_out['n_stage']),
-                    [n_mask] * len(cli_out['n_stage'])
                 )
-                m_loss_tr = self.focal_loss_m(
+                m_loss_tr = self.ce_loss_m(
                     cli_out['m_stage'],
                     [m_label] * len(cli_out['m_stage']),
-                    [m_mask] * len(cli_out['m_stage'])
                 )
 
-            else:
-                loc_loss_tr = self.focal_loss_loc(cli_out['location'], loc_label, loc_mask)
-                t_loss_tr = self.focal_loss_t(cli_out['t_stage'], t_label, t_mask)
-                n_loss_tr = self.focal_loss_n(cli_out['n_stage'], n_label, n_mask)
-                m_loss_tr = self.focal_loss_m(cli_out['m_stage'], m_label, m_mask)
 
-            # --- 總損失 ---
+            else:
+                # # focal loss
+                # loc_loss_tr = self.focal_loss_loc(cli_out['location'], loc_label, loc_mask)
+                # t_loss_tr = self.focal_loss_t(cli_out['t_stage'], t_label, t_mask)
+                # n_loss_tr = self.focal_loss_n(cli_out['n_stage'], n_label, n_mask)
+                # m_loss_tr = self.focal_loss_m(cli_out['m_stage'], m_label, m_mask)
+
+                # ce loss
+                loc_loss_tr = self.ce_loss_loc(cli_out['location'], loc_label)
+                t_loss_tr = self.ce_loss_t(cli_out['t_stage'], t_label)
+                n_loss_tr = self.ce_loss_n(cli_out['n_stage'], n_label)
+                m_loss_tr = self.ce_loss_m(cli_out['m_stage'], m_label)
+                
+            # 只在每個 epoch 開始時計算梯度範數以減少計算負擔
+            if self.current_epoch != self.last_grad_norm_update_epoch:
+                # 計算每個任務的 grad norm
+                seg_grad_norm = self._calculate_grad_norm(seg_loss_tr)
+                loc_grad_norm = self._calculate_grad_norm(loc_loss_tr)
+                t_grad_norm = self._calculate_grad_norm(t_loss_tr)
+                n_grad_norm = self._calculate_grad_norm(n_loss_tr)
+                m_grad_norm = self._calculate_grad_norm(m_loss_tr)
+                
+                # 更新 grad norm 的 EMA
+                self._update_ema_grad_norm('seg', seg_grad_norm) # 更新 self.ema_grad_norm[key]
+                self._update_ema_grad_norm('location', loc_grad_norm)
+                self._update_ema_grad_norm('t_stage', t_grad_norm)
+                self._update_ema_grad_norm('n_stage', n_grad_norm)
+                self._update_ema_grad_norm('m_stage', m_grad_norm)
+                
+                # 防止除以零
+                eps = 1e-8
+                
+                # 計算權重 (將 grad norm 的 ema 進行倒數)
+                if self.ema_grad_norm['seg'] >= eps:
+                    # 分割任務是主要任務，使用它的梯度範數作為基準
+                    seg_norm = max(self.ema_grad_norm['seg'], eps)
+                    
+                    # 根據梯度範數比例計算調整因子
+                    for key in ['location', 't_stage', 'n_stage', 'm_stage']:
+                        task_norm = max(self.ema_grad_norm[key], eps)
+                        # 倒數
+                        norm_ratio = seg_norm / task_norm
+                        # 限制權重上限
+                        self.grad_norm_factors[key] = min(norm_ratio, 5.0)
+
+
+                # 更新最後計算梯度範數的 epoch
+                self.last_grad_norm_update_epoch = self.current_epoch
+
+                # 每個 epoch 開始時輸出一次梯度範數和調整因子 (方便調試)
+                if self.local_rank == 0:
+                    self.print_to_log_file(f"Epoch {self.current_epoch} - Grad Norms: seg={seg_grad_norm:.4f}, "
+                                          f"loc={loc_grad_norm:.4f}, t={t_grad_norm:.4f}, "
+                                          f"n={n_grad_norm:.4f}, m={m_grad_norm:.4f}")
+                    self.print_to_log_file(f"Epoch {self.current_epoch} - EMA Norms: seg={self.ema_grad_norm['seg']:.4f}, "
+                                          f"loc={self.ema_grad_norm['location']:.4f}, "
+                                          f"t={self.ema_grad_norm['t_stage']:.4f}, "
+                                          f"n={self.ema_grad_norm['n_stage']:.4f}, "
+                                          f"m={self.ema_grad_norm['m_stage']:.4f}")
+                    self.print_to_log_file(f"Epoch {self.current_epoch} - GradNorm Factors: "
+                                        f"seg={self.grad_norm_factors['seg']:.4f}, "
+                                        f"loc={self.grad_norm_factors['location']:.4f}, "
+                                        f"t={self.grad_norm_factors['t_stage']:.4f}, "
+                                        f"n={self.grad_norm_factors['n_stage']:.4f}, "
+                                        f"m={self.grad_norm_factors['m_stage']:.4f}")
+                    self.print_to_log_file(f"Epoch {self.current_epoch} - Base Weights: "
+                                        f"seg={self.clinical_loss_manual_weights.get('seg', 1.0):.4f}, "
+                                        f"loc={self.clinical_loss_manual_weights['location']:.4f}, "
+                                        f"t={self.clinical_loss_manual_weights['t_stage']:.4f}, "
+                                        f"n={self.clinical_loss_manual_weights['n_stage']:.4f}, "
+                                        f"m={self.clinical_loss_manual_weights['m_stage']:.4f}")
+                    self.print_to_log_file(f"Epoch {self.current_epoch} - Final Weights: "
+                                        f"seg={self.clinical_loss_manual_weights.get('seg', 1.0) * self.grad_norm_factors['seg']:.4f}, "
+                                        f"loc={self.clinical_loss_manual_weights['location'] * self.grad_norm_factors['location']:.4f}, "
+                                        f"t={self.clinical_loss_manual_weights['t_stage'] * self.grad_norm_factors['t_stage']:.4f}, "
+                                        f"n={self.clinical_loss_manual_weights['n_stage'] * self.grad_norm_factors['n_stage']:.4f}, "
+                                        f"m={self.clinical_loss_manual_weights['m_stage'] * self.grad_norm_factors['m_stage']:.4f}")
+                    self.print_to_log_file("") # 空行
+            
+
+            # 計算各類最終損失
+            # 確保 'seg' 鍵存在於 clinical_loss_manual_weights 中，否則使用預設值 1.0
+            seg_weight = self.clinical_loss_manual_weights.get('seg', 1.0)
+            final_loss_seg = seg_weight * self.grad_norm_factors['seg'] * seg_loss_tr
+            final_loss_loc = self.clinical_loss_manual_weights['location'] * self.grad_norm_factors['location'] * loc_loss_tr
+            final_loss_t = self.clinical_loss_manual_weights['t_stage'] * self.grad_norm_factors['t_stage'] * t_loss_tr
+            final_loss_n = self.clinical_loss_manual_weights['n_stage'] * self.grad_norm_factors['n_stage'] * n_loss_tr
+            final_loss_m = self.clinical_loss_manual_weights['m_stage'] * self.grad_norm_factors['m_stage'] * m_loss_tr
+
+            # --- 最終總損失 ---
             total_loss = (
-                seg_loss_tr +
-                # 權重 * loss
-                self.clinical_loss_weights['location'] * loc_loss_tr +
-                self.clinical_loss_weights['t_stage'] * t_loss_tr +
-                self.clinical_loss_weights['n_stage'] * n_loss_tr +
-                self.clinical_loss_weights['m_stage'] * m_loss_tr
+                final_loss_seg +
+                # 權重 * 梯度調整因子 * loss
+                final_loss_loc +
+                final_loss_t +
+                final_loss_n +
+                final_loss_m
             )
 
         # 梯度計算 反向更新
@@ -603,14 +775,67 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
 
         # 返回所有損失值 (轉移到 CPU 並轉換為 numpy)
         return {
-            'loss': total_loss.detach().cpu().numpy(),
+            # 原始損失
             'seg_loss': seg_loss_tr.detach().cpu().numpy(),
             'loc_loss': loc_loss_tr.detach().cpu().numpy(),
             't_loss': t_loss_tr.detach().cpu().numpy(),
             'n_loss': n_loss_tr.detach().cpu().numpy(),
             'm_loss': m_loss_tr.detach().cpu().numpy(),
+            # 最終權重 (基本權重 * 調整因子)
+            'final_weight_seg': np.array(self.clinical_loss_manual_weights.get('seg', 1.0) * self.grad_norm_factors['seg']),
+            'final_weight_loc': np.array(self.clinical_loss_manual_weights['location'] * self.grad_norm_factors['location']),
+            'final_weight_t': np.array(self.clinical_loss_manual_weights['t_stage'] * self.grad_norm_factors['t_stage']),
+            'final_weight_n': np.array(self.clinical_loss_manual_weights['n_stage'] * self.grad_norm_factors['n_stage']),
+            'final_weight_m': np.array(self.clinical_loss_manual_weights['m_stage'] * self.grad_norm_factors['m_stage']),
+            # 最終損失
+            'loss': total_loss.detach().cpu().numpy(), # 總損失
+            'final_loss_seg': final_loss_seg.detach().cpu().numpy(),
+            'final_loss_loc': final_loss_loc.detach().cpu().numpy(),
+            'final_loss_t': final_loss_t.detach().cpu().numpy(),
+            'final_loss_n': final_loss_n.detach().cpu().numpy(),
+            'final_loss_m': final_loss_m.detach().cpu().numpy(),
         }
 
+    def _calculate_grad_norm(self, loss):
+        """
+        計算梯度大小 (norm)
+        
+        當輸入的 loss 不是標量時，會先對其進行平均操作，確保它是標量
+        然後通過反向傳播計算梯度，並計算所有參數梯度的 L2 範數
+        """
+        # 確保損失是標量
+        if loss.dim() > 0:  # 如果損失不是標量
+            loss = loss.mean()  # 取平均值變成標量
+            
+        # 清零梯度
+        self.optimizer.zero_grad(set_to_none=True)
+        
+        # 反向傳播以計算梯度 (但不進行更新)
+        loss.backward(retain_graph=True)
+        
+        # 先裁剪梯度，然後計算範數
+        torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+
+        # 計算梯度大小
+        grad_norm = 0.0
+        for param in self.network.parameters():
+            if param.grad is not None:
+                grad_norm += torch.sum(param.grad ** 2).item()
+        grad_norm = np.sqrt(grad_norm)
+        
+        # 清零梯度以準備下一次計算
+        self.optimizer.zero_grad(set_to_none=True)
+        
+        return grad_norm
+        
+    def _update_ema_grad_norm(self, key, grad_norm):
+        """
+        更新指定任務的 EMA 梯度範數
+        """
+        # # ema = alpha * 舊的 ema + (1 - alpha) * 新的值
+        self.ema_grad_norm[key] = self.ema_alpha * self.ema_grad_norm[key] + (1 - self.ema_alpha) * grad_norm
+        return self.ema_grad_norm[key]
+    
     def on_train_epoch_end(self, train_outputs: List[dict]):
         """
         在每個訓練 Epoch 結束時彙總結果並記錄。
@@ -619,17 +844,17 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
         outputs = collate_outputs(train_outputs)
 
         if self.is_ddp:
-            # 彙總所有 worker 的損失
+            # # 彙總所有 worker 的損失
+            # 最終總損失
             losses_tr_total = [None for _ in range(dist.get_world_size())]
             dist.all_gather_object(losses_tr_total, outputs['loss'])
             loss_here = np.vstack(losses_tr_total).mean()
 
-            # 彙總分割損失
+            # 原始損失
             seg_losses_tr = [None for _ in range(dist.get_world_size())]
             dist.all_gather_object(seg_losses_tr, outputs['seg_loss'])
             seg_loss_here = np.vstack(seg_losses_tr).mean()
 
-            # 彙總其他臨床損失
             loc_losses_tr = [None for _ in range(dist.get_world_size())]
             dist.all_gather_object(loc_losses_tr, outputs['loc_loss'])
             loc_loss_here = np.vstack(loc_losses_tr).mean()
@@ -646,23 +871,92 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
             dist.all_gather_object(m_losses_tr, outputs['m_loss'])
             m_loss_here = np.vstack(m_losses_tr).mean()
 
+            # 最終權重
+            final_weight_seg = [None for _ in range(dist.get_world_size())]
+            dist.all_gather_object(final_weight_seg, outputs['final_weight_seg'])
+            final_weight_seg = np.vstack(final_weight_seg).mean()
+
+            final_weight_loc = [None for _ in range(dist.get_world_size())]
+            dist.all_gather_object(final_weight_loc, outputs['final_weight_loc'])
+            final_weight_loc = np.vstack(final_weight_loc).mean()
+
+            final_weight_t = [None for _ in range(dist.get_world_size())]
+            dist.all_gather_object(final_weight_t, outputs['final_weight_t'])
+            final_weight_t = np.vstack(final_weight_t).mean()
+
+            final_weight_n = [None for _ in range(dist.get_world_size())]
+            dist.all_gather_object(final_weight_n, outputs['final_weight_n'])
+            final_weight_n = np.vstack(final_weight_n).mean()
+
+            final_weight_m = [None for _ in range(dist.get_world_size())]
+            dist.all_gather_object(final_weight_m, outputs['final_weight_m'])
+            final_weight_m = np.vstack(final_weight_m).mean()
+
+            # 最終損失
+            final_loss_seg = [None for _ in range(dist.get_world_size())]
+            dist.all_gather_object(final_loss_seg, outputs['final_loss_seg'])
+            final_loss_seg = np.vstack(final_loss_seg).mean()
+
+            final_loss_loc = [None for _ in range(dist.get_world_size())]
+            dist.all_gather_object(final_loss_loc, outputs['final_loss_loc'])
+            final_loss_loc = np.vstack(final_loss_loc).mean()
+
+            final_loss_t = [None for _ in range(dist.get_world_size())]
+            dist.all_gather_object(final_loss_t, outputs['final_loss_t'])
+            final_loss_t = np.vstack(final_loss_t).mean()
+
+            final_loss_n = [None for _ in range(dist.get_world_size())]
+            dist.all_gather_object(final_loss_n, outputs['final_loss_n'])
+            final_loss_n = np.vstack(final_loss_n).mean()
+
+            final_loss_m = [None for _ in range(dist.get_world_size())]
+            dist.all_gather_object(final_loss_m, outputs['final_loss_m'])
+            final_loss_m = np.vstack(final_loss_m).mean()
+
         else:
+            # 最終總損失
             loss_here = np.mean(outputs['loss'])
+            # 原始損失
             seg_loss_here = np.mean(outputs['seg_loss'])
             loc_loss_here = np.mean(outputs['loc_loss'])
             t_loss_here = np.mean(outputs['t_loss'])
             n_loss_here = np.mean(outputs['n_loss'])
             m_loss_here = np.mean(outputs['m_loss'])
+            # 最終權重
+            final_weight_seg = np.mean(outputs['final_weight_seg'])
+            final_weight_loc = np.mean(outputs['final_weight_loc'])
+            final_weight_t = np.mean(outputs['final_weight_t'])
+            final_weight_n = np.mean(outputs['final_weight_n'])
+            final_weight_m = np.mean(outputs['final_weight_m'])
+            # 最終損失
+            final_loss_seg = np.mean(outputs['final_loss_seg'])
+            final_loss_loc = np.mean(outputs['final_loss_loc'])
+            final_loss_t = np.mean(outputs['final_loss_t'])
+            final_loss_n = np.mean(outputs['final_loss_n'])
+            final_loss_m = np.mean(outputs['final_loss_m'])
 
         # 記錄到 logger（全部使用 train_xxx_losses）
         self.logger.log('train_losses', seg_loss_here, self.current_epoch) # 給原生 trainer logger 用 避免報錯
+        # 最終總損失
         self.logger.log('train_total_losses', loss_here, self.current_epoch)
+        # 原始損失
         self.logger.log('train_seg_losses', seg_loss_here, self.current_epoch)
         self.logger.log('train_loc_losses', loc_loss_here, self.current_epoch)
         self.logger.log('train_t_losses', t_loss_here, self.current_epoch)
         self.logger.log('train_n_losses', n_loss_here, self.current_epoch)
         self.logger.log('train_m_losses', m_loss_here, self.current_epoch)
-
+        # 最終權重
+        self.logger.log('tr_loss_weights_seg', final_weight_seg, self.current_epoch)
+        self.logger.log('tr_loss_weights_loc', final_weight_loc, self.current_epoch)
+        self.logger.log('tr_loss_weights_t', final_weight_t, self.current_epoch)
+        self.logger.log('tr_loss_weights_n', final_weight_n, self.current_epoch)
+        self.logger.log('tr_loss_weights_m', final_weight_m, self.current_epoch)
+        # 最終損失
+        self.logger.log('tr_final_loss_seg', final_loss_seg, self.current_epoch)
+        self.logger.log('tr_final_loss_loc', final_loss_loc, self.current_epoch)
+        self.logger.log('tr_final_loss_t', final_loss_t, self.current_epoch)
+        self.logger.log('tr_final_loss_n', final_loss_n, self.current_epoch)
+        self.logger.log('tr_final_loss_m', final_loss_m, self.current_epoch)
 
     def validation_step(self, batch: dict) -> dict:
         """
@@ -843,12 +1137,21 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
             m_acc_val = m_correct_valid.float().sum() / m_valid.sum().clamp(min=1)
 
             
+            # 計算各類最終損失 (加上 grad_norm_factors 調整)
+            seg_weight = self.clinical_loss_manual_weights.get('seg', 1.0)
+            final_loss_seg = seg_weight * self.grad_norm_factors['seg'] * seg_loss_val
+            final_loss_loc = self.clinical_loss_manual_weights['location'] * self.grad_norm_factors['location'] * loc_loss_val
+            final_loss_t = self.clinical_loss_manual_weights['t_stage'] * self.grad_norm_factors['t_stage'] * t_loss_val
+            final_loss_n = self.clinical_loss_manual_weights['n_stage'] * self.grad_norm_factors['n_stage'] * n_loss_val
+            final_loss_m = self.clinical_loss_manual_weights['m_stage'] * self.grad_norm_factors['m_stage'] * m_loss_val
+
+            # 最終總損失
             total_loss = (
-                seg_loss_val +
-                self.clinical_loss_weights['location'] * loc_loss_val +
-                self.clinical_loss_weights['t_stage'] * t_loss_val +
-                self.clinical_loss_weights['n_stage'] * n_loss_val +
-                self.clinical_loss_weights['m_stage'] * m_loss_val
+                final_loss_seg +
+                final_loss_loc +
+                final_loss_t +
+                final_loss_n +
+                final_loss_m
             )
 
         # 回傳所有損失和指標（轉到 CPU 並轉 numpy）
@@ -859,6 +1162,11 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
             't_loss': t_loss_val.detach().cpu().numpy(),
             'n_loss': n_loss_val.detach().cpu().numpy(),
             'm_loss': m_loss_val.detach().cpu().numpy(),
+            'final_loss_seg': final_loss_seg.detach().cpu().numpy(),
+            'final_loss_loc': final_loss_loc.detach().cpu().numpy(),
+            'final_loss_t': final_loss_t.detach().cpu().numpy(),
+            'final_loss_n': final_loss_n.detach().cpu().numpy(),
+            'final_loss_m': final_loss_m.detach().cpu().numpy(),
             'loc_acc': loc_acc_val.detach().cpu().numpy(),
             't_acc': t_acc_val.detach().cpu().numpy(),
             'n_acc': n_acc_val.detach().cpu().numpy(),
@@ -921,6 +1229,27 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
             m_losses_val = [None for _ in range(dist.get_world_size())]
             dist.all_gather_object(m_losses_val, outputs_collated['m_loss'])
             m_loss_here = np.vstack(m_losses_val).mean()
+            
+            # 彙總所有 worker 的調整後損失
+            final_seg_losses_val = [None for _ in range(dist.get_world_size())]
+            dist.all_gather_object(final_seg_losses_val, outputs_collated['final_loss_seg'])
+            final_seg_loss_here = np.vstack(final_seg_losses_val).mean()
+            
+            final_loc_losses_val = [None for _ in range(dist.get_world_size())]
+            dist.all_gather_object(final_loc_losses_val, outputs_collated['final_loss_loc'])
+            final_loc_loss_here = np.vstack(final_loc_losses_val).mean()
+            
+            final_t_losses_val = [None for _ in range(dist.get_world_size())]
+            dist.all_gather_object(final_t_losses_val, outputs_collated['final_loss_t'])
+            final_t_loss_here = np.vstack(final_t_losses_val).mean()
+            
+            final_n_losses_val = [None for _ in range(dist.get_world_size())]
+            dist.all_gather_object(final_n_losses_val, outputs_collated['final_loss_n'])
+            final_n_loss_here = np.vstack(final_n_losses_val).mean()
+            
+            final_m_losses_val = [None for _ in range(dist.get_world_size())]
+            dist.all_gather_object(final_m_losses_val, outputs_collated['final_loss_m'])
+            final_m_loss_here = np.vstack(final_m_losses_val).mean()
 
             # 彙總所有 worker 的臨床準確度 (需要加權平均或只取有數據的樣本)
             # 為了簡化，我們將收集所有樣本的準確度，然後平均
@@ -947,6 +1276,13 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
             t_loss_here = np.mean(outputs_collated['t_loss'])
             n_loss_here = np.mean(outputs_collated['n_loss'])
             m_loss_here = np.mean(outputs_collated['m_loss'])
+            
+            # 調整後的損失
+            final_seg_loss_here = np.mean(outputs_collated['final_loss_seg'])
+            final_loc_loss_here = np.mean(outputs_collated['final_loss_loc'])
+            final_t_loss_here = np.mean(outputs_collated['final_loss_t'])
+            final_n_loss_here = np.mean(outputs_collated['final_loss_n'])
+            final_m_loss_here = np.mean(outputs_collated['final_loss_m'])
 
             loc_acc_here = np.mean(outputs_collated['loc_acc'])
             t_acc_here = np.mean(outputs_collated['t_acc'])
@@ -967,6 +1303,13 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
         self.logger.log('val_t_losses', t_loss_here, self.current_epoch)
         self.logger.log('val_n_losses', n_loss_here, self.current_epoch)
         self.logger.log('val_m_losses', m_loss_here, self.current_epoch)
+        
+        # 記錄調整後的損失
+        self.logger.log('val_final_loss_seg', final_seg_loss_here, self.current_epoch)
+        self.logger.log('val_final_loss_loc', final_loc_loss_here, self.current_epoch)
+        self.logger.log('val_final_loss_t', final_t_loss_here, self.current_epoch)
+        self.logger.log('val_final_loss_n', final_n_loss_here, self.current_epoch)
+        self.logger.log('val_final_loss_m', final_m_loss_here, self.current_epoch)
 
         self.logger.log('val_loc_accs', loc_acc_here, self.current_epoch)
         self.logger.log('val_t_accs', t_acc_here, self.current_epoch)
@@ -988,6 +1331,13 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
             self.print_to_log_file(f"Val N Stage Acc: {np.round(n_acc, decimals=4)}", add_timestamp=True)
             self.print_to_log_file(f"Val M Stage Acc: {np.round(m_acc, decimals=4)}", add_timestamp=True)
             
+            # # 輸出調整後的損失
+            # self.print_to_log_file(f"Val Final Losses - Seg: {np.round(final_seg_loss_here, decimals=4)}, "
+            #                       f"Loc: {np.round(final_loc_loss_here, decimals=4)}, "
+            #                       f"T: {np.round(final_t_loss_here, decimals=4)}, "
+            #                       f"N: {np.round(final_n_loss_here, decimals=4)}, "
+            #                       f"M: {np.round(final_m_loss_here, decimals=4)}", add_timestamp=True)
+            
             # 更新最佳 EMA pseudo Dice 的邏輯已經在父類 on_epoch_end 中處理
             # 如果需要根據臨床指標決定 best checkpoint，需要修改父類的邏輯或在這裡添加額外判斷
 
@@ -999,45 +1349,50 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
         覆寫父類的 on_epoch_end 方法。
         """
         # 更新臨床損失權重
-        self.update_clinical_loss_weights()
+        self.update_clinical_loss_manual_weights()
 
         super().on_epoch_end() # 調用父類方法處理時間戳、Dice 記錄和檢查點儲存
 
+        self.lr_scheduler.step() # 
 
-    def update_clinical_loss_weights(self):
+
+
+    def update_clinical_loss_manual_weights(self):
         """
-        根據當前 epoch 動態更新臨床損失權重。
-        在 start_epoch 之前權重為 0。
-        在 start_epoch 到 end_epoch 之間線性增長至目標權重。
-        在 end_epoch 之後保持目標權重。
+        根據當前 epoch 從權重控制點列表動態更新臨床損失權重。
+        使用分段線性插值計算當前 epoch 的權重值。
         """
         current_epoch = self.current_epoch
-        start_epoch = self.clinical_loss_start_epoch
-        end_epoch = self.clinical_loss_end_epoch
-
-        if current_epoch < start_epoch:
-            # Epoch 小於起始 epoch，權重保持為 0
-            # self.clinical_loss_weights 已經初始化為 0，無需更改
-            pass
-        elif current_epoch >= start_epoch and current_epoch <= end_epoch:
-            # 在線性增長區間內
-            # 計算增長比例
-            progress_ratio = (current_epoch - start_epoch) / (end_epoch - start_epoch)
-            # 對每個權重項進行線性插值
-            for key in self.clinical_loss_weights.keys():
-                target_weight = self.target_clinical_loss_weights.get(key, 0.0)
-                # 使用線性插值：current_weight = start_weight + ratio * (target_weight - start_weight)
-                # start_weight 是 0
-                self.clinical_loss_weights[key] = 0.0 + progress_ratio * (target_weight - 0.0)
-        else:
-            # Epoch 大於結束 epoch，權重設為目標權重
-            self.clinical_loss_weights = self.target_clinical_loss_weights.copy()
+        
+        # 對每個任務分別進行處理
+        for task, schedule in self.clinical_loss_weight_schedule.items():
+            # 如果當前 epoch 小於第一個控制點的 epoch，使用第一個控制點的權重
+            if current_epoch <= schedule[0][0]:
+                self.clinical_loss_manual_weights[task] = schedule[0][1]
+                continue
+                
+            # 如果當前 epoch 大於等於最後一個控制點的 epoch，使用最後一個控制點的權重
+            if current_epoch >= schedule[-1][0]:
+                self.clinical_loss_manual_weights[task] = schedule[-1][1]
+                continue
+                
+            # 找到當前 epoch 所在的區間
+            for i in range(len(schedule) - 1):
+                epoch_start, weight_start = schedule[i]
+                epoch_end, weight_end = schedule[i + 1]
+                
+                if epoch_start <= current_epoch < epoch_end:
+                    # 計算在當前區間內的插值比例
+                    progress_ratio = (current_epoch - epoch_start) / (epoch_end - epoch_start)
+                    # 線性插值計算當前權重
+                    current_weight = weight_start + progress_ratio * (weight_end - weight_start)
+                    self.clinical_loss_manual_weights[task] = current_weight
+                    break
 
         # 可選：打印當前權重（僅在 rank 0 進程，避免重複打印）
         if self.local_rank == 0:
-            # 每隔一定 epoch 打印一次，或只在權重開始變化時打印
-            if current_epoch >= start_epoch :
-                self.print_to_log_file(f"Epoch {current_epoch}: 更新臨床損失權重為 {self.clinical_loss_weights}")
+            # 打印當前權重
+            self.print_to_log_file(f"Epoch {current_epoch}: 更新臨床損失權重為 {self.clinical_loss_manual_weights}")
 
 
     def set_deep_supervision_enabled(self, enabled: bool):
@@ -1049,6 +1404,27 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
             mod.set_deep_supervision(enabled)
         else:
             mod.decoder.deep_supervision = enabled
+
+    # 改成使用 AdamW 
+    def configure_optimizers(self):
+        # 設置優化器初始學習率
+        initial_lr = self.initial_lr/100  # 1e-2 / 100 = 1e-4
+        
+        optimizer = torch.optim.AdamW(self.network.parameters(),
+                                      lr=initial_lr,  # 直接設置初始學習率
+                                      weight_decay=self.weight_decay*100, # 3e-5 * 100= 3e-3
+                                      betas=(0.9, 0.999),
+                                      eps=1e-8)
+        
+        from torch.optim.lr_scheduler import CosineAnnealingLR
+        # 使用 CosineAnnealingLR，每個 epoch 更新一次
+        lr_scheduler = CosineAnnealingLR(
+            optimizer,
+            T_max=self.num_epochs,  # 週期長度
+            eta_min=initial_lr/1000,  # 最小學習率
+        )
+        return optimizer, lr_scheduler
+
 
     def perform_actual_validation(self, save_probabilities: bool = False):
         """

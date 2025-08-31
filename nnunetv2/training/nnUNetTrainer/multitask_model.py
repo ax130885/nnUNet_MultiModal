@@ -327,11 +327,37 @@ class MyMultiModel(nn.Module):
         self.seg_layers.append(nn.Conv3d(32, num_classes, kernel_size=1))
         self.cli_layers.append(self._create_cli_predictor(32))
 
-        # 分類頭
-        self.loc_head = nn.Linear(128, self.missing_flag_location)  # 輸出所有類別（不包括Missing對應的索引）
-        self.t_head   = nn.Linear(128, self.missing_flag_t_stage)
-        self.n_head   = nn.Linear(128, self.missing_flag_n_stage)
-        self.m_head   = nn.Linear(128, self.missing_flag_m_stage)
+        # # 分類頭
+        # self.loc_head = nn.Linear(128, self.missing_flag_location)  # 輸出所有類別（不包括Missing對應的索引）
+        # self.t_head   = nn.Linear(128, self.missing_flag_t_stage)
+        # self.n_head   = nn.Linear(128, self.missing_flag_n_stage)
+        # self.m_head   = nn.Linear(128, self.missing_flag_m_stage)
+
+        self.loc_head = nn.Sequential(
+            nn.Linear(128, 64),
+            nn.LeakyReLU(0.01, inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(64, self.missing_flag_location)
+        )
+        self.t_head = nn.Sequential(
+            nn.Linear(128, 64),
+            nn.LeakyReLU(0.01, inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(64, self.missing_flag_t_stage)
+        )
+        self.n_head = nn.Sequential(
+            nn.Linear(128, 64),
+            nn.LeakyReLU(0.01, inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(64, self.missing_flag_n_stage)
+        )
+        self.m_head = nn.Sequential(
+            nn.Linear(128, 64),
+            nn.LeakyReLU(0.01, inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(64, self.missing_flag_m_stage)
+        )
+
 
         # 初始化權重
         self.apply(self._init_weights)

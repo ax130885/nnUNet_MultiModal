@@ -28,8 +28,8 @@ class nnUNetDataLoaderMultimodal(nnUNetDataLoader):
                  pad_sides: Union[List[int], Tuple[int, ...]] = None,
                  probabilistic_oversampling: bool = False,
                  transforms=None,
-                 clinical_drop_probability_global: float = 0.3,
-                 clinical_drop_probability_column: float = 0.1
+                 clinical_drop_probability_global: float = 0.35,
+                 clinical_drop_probability_column: float = 0.35
                  ):
         """
         初始化多模態資料載入器。

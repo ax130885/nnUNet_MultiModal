@@ -19,6 +19,7 @@ class nnUNetLoggerMultimodal(nnUNetLogger):
         # 添加新的日誌項目
         self.my_fantastic_logging.update({
             'train_total_losses': list(),
+
             'train_seg_losses': list(),
             'train_loc_losses': list(),
             'train_t_losses': list(),
@@ -36,6 +37,24 @@ class nnUNetLoggerMultimodal(nnUNetLogger):
             'val_t_accs': list(),
             'val_n_accs': list(),
             'val_m_accs': list(),
+
+            'tr_loss_weights_seg': list(),
+            'tr_loss_weights_loc': list(),
+            'tr_loss_weights_t': list(),
+            'tr_loss_weights_n': list(),
+            'tr_loss_weights_m': list(),
+
+            'tr_final_loss_seg': list(),
+            'tr_final_loss_loc': list(),
+            'tr_final_loss_t': list(),
+            'tr_final_loss_n': list(),
+            'tr_final_loss_m': list(),
+
+            'val_final_loss_seg': list(),
+            'val_final_loss_loc': list(),
+            'val_final_loss_t': list(),
+            'val_final_loss_n': list(),
+            'val_final_loss_m': list(),
         })
 
 
@@ -54,21 +73,22 @@ class nnUNetLoggerMultimodal(nnUNetLogger):
         sns.set(font_scale=2.5)
         # 這裡設 8 個子圖，依序對應：分割損失與dice、臨床損失、臨床acc、epoch耗時、學習率
         # fig, ax_all = plt.subplots(8, 1, figsize=(30, 18*8))
-        fig, ax_all = plt.subplots(8, 1, figsize=(30, 18*6))
+        fig, ax_all = plt.subplots(10, 1, figsize=(30, 18*10))
         x_values = list(range(epoch + 1))
 
         # --- 1. 分割損失和 Dice ---
         ax = ax_all[0]
         ax2 = ax.twinx()
-        ax.plot(x_values, self.my_fantastic_logging['train_seg_losses'][:epoch + 1], color='b', ls='-', label="loss_tr", linewidth=4)
-        ax.plot(x_values, self.my_fantastic_logging['val_seg_losses'][:epoch + 1], color='r', ls='-', label="loss_val", linewidth=4)
+        # 平移分割損失，將最小值從 -1 調整到 0，使其與其他損失在相同尺度
+        ax.plot(x_values, [loss + 1.0 for loss in self.my_fantastic_logging['train_seg_losses'][:epoch + 1]], color='b', ls='-', label="loss_tr (+1)", linewidth=4)
+        ax.plot(x_values, [loss + 1.0 for loss in self.my_fantastic_logging['val_seg_losses'][:epoch + 1]], color='r', ls='-', label="loss_val (+1)", linewidth=4)
         if len(self.my_fantastic_logging['mean_fg_dice']) > 0:
             ax2.plot(x_values, self.my_fantastic_logging['mean_fg_dice'][:epoch + 1], color='g', ls='dotted', label="pseudo dice", linewidth=3)
         if len(self.my_fantastic_logging['ema_fg_dice']) > 0:
             ax2.plot(x_values, self.my_fantastic_logging['ema_fg_dice'][:epoch + 1], color='g', ls='-', label="pseudo dice (mov. avg.)", linewidth=4)
         ax.set_xlabel("epoch")
         ax.set_ylabel("loss")
-        ax2.set_ylabel("pseudo dice")
+        ax2.set_ylabel("val pseudo dice")
         ax.legend(loc=(0, 1))
         ax2.legend(loc=(0.2, 1))
         ax.set_title("Segmentation Loss and Dice")
@@ -100,10 +120,10 @@ class nnUNetLoggerMultimodal(nnUNetLogger):
         # --- 3. 臨床分類準確度 ---
         ax = ax_all[5]
         # ax = ax_all[3]
-        ax.plot(x_values, self.my_fantastic_logging['val_loc_accs'][:epoch + 1], color='purple', ls='-', label="Loc Acc", linewidth=3)
-        ax.plot(x_values, self.my_fantastic_logging['val_t_accs'][:epoch + 1], color='orange', ls='--', label="T Acc", linewidth=3)
-        ax.plot(x_values, self.my_fantastic_logging['val_n_accs'][:epoch + 1], color='brown', ls='-.', label="N Acc", linewidth=3)
-        ax.plot(x_values, self.my_fantastic_logging['val_m_accs'][:epoch + 1], color='pink', ls=':', label="M Acc", linewidth=3)
+        ax.plot(x_values, self.my_fantastic_logging['val_loc_accs'][:epoch + 1], color='r', ls='-', label="Loc Acc", linewidth=3)
+        ax.plot(x_values, self.my_fantastic_logging['val_t_accs'][:epoch + 1], color='g', ls='-', label="T Acc", linewidth=3)
+        ax.plot(x_values, self.my_fantastic_logging['val_n_accs'][:epoch + 1], color='c', ls='-', label="N Acc", linewidth=3)
+        ax.plot(x_values, self.my_fantastic_logging['val_m_accs'][:epoch + 1], color='m', ls='-', label="M Acc", linewidth=3)
         ax.set_xlabel("epoch")
         ax.set_ylabel("Clinical Accuracy")
         ax.legend(loc=(0, 1))
@@ -130,6 +150,33 @@ class nnUNetLoggerMultimodal(nnUNetLogger):
         ax.legend(loc=(0, 1))
         ax.set_title("Learning Rate")
 
+        # --- 6. 各損失權重
+        ax = ax_all[8]
+        ax.plot(x_values, self.my_fantastic_logging['tr_loss_weights_seg'][:epoch + 1], color='b', ls='-', label="seg weight", linewidth=4)
+        ax.plot(x_values, self.my_fantastic_logging['tr_loss_weights_loc'][:epoch + 1], color='r', ls='-', label="loc weight", linewidth=4)
+        ax.plot(x_values, self.my_fantastic_logging['tr_loss_weights_t'][:epoch + 1], color='g', ls='-', label="t weight", linewidth=4)
+        ax.plot(x_values, self.my_fantastic_logging['tr_loss_weights_n'][:epoch + 1], color='c', ls='-', label="n weight", linewidth=4)
+        ax.plot(x_values, self.my_fantastic_logging['tr_loss_weights_m'][:epoch + 1], color='m', ls='-', label="m weight", linewidth=4)
+        ax.set_xlabel("epoch")
+        ax.set_ylabel("loss weight")
+        ax.legend(loc=(0, 1))
+        ax.set_title("Loss Weights (Grad Norm ema * Manual Weight)")
+
+        # ---7. 權重*損失
+        ax = ax_all[9]
+        # 平移分割最終損失和總損失，使最小值從 -1 調整到 0
+        ax.plot(x_values, [loss + 1.0 for loss in self.my_fantastic_logging['train_total_losses'][:epoch + 1]], color='purple', ls='-', label="total final loss (+1)", linewidth=4)
+        ax.plot(x_values, [loss + 1.0 for loss in self.my_fantastic_logging['tr_final_loss_seg'][:epoch + 1]], color='b', ls='-', label="seg final loss (+1)", linewidth=4)
+        ax.plot(x_values, self.my_fantastic_logging['tr_final_loss_loc'][:epoch + 1], color='r', ls='-', label="loc final loss", linewidth=4)
+        ax.plot(x_values, self.my_fantastic_logging['tr_final_loss_t'][:epoch + 1], color='g', ls='-', label="t final loss", linewidth=4)
+        ax.plot(x_values, self.my_fantastic_logging['tr_final_loss_n'][:epoch + 1], color='c', ls='-', label="n final loss", linewidth=4)
+        ax.plot(x_values, self.my_fantastic_logging['tr_final_loss_m'][:epoch + 1], color='m', ls='-', label="m final loss", linewidth=4)
+        ax.set_xlabel("epoch")
+        ax.set_ylabel("final loss")
+        ax.legend(loc=(0, 1))
+        ax.set_title("Final Losses (Weight * Loss)")
+
+        # 畫圖
         plt.tight_layout()
         fig.savefig(join(output_folder, "progress_multimodal.png")) # 另存為不同檔案名
         plt.close()
