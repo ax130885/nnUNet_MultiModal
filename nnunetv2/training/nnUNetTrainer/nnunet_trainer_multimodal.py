@@ -672,15 +672,15 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
                 t_loss_tr = self.ce_loss_t(cli_out['t_stage'], t_label)
                 n_loss_tr = self.ce_loss_n(cli_out['n_stage'], n_label)
                 m_loss_tr = self.ce_loss_m(cli_out['m_stage'], m_label)
-                
+
             # 只在每個 epoch 開始時計算梯度範數以減少計算負擔
             if self.current_epoch != self.last_grad_norm_update_epoch:
                 # 計算每個任務的 grad norm
-                seg_grad_norm = self._calculate_grad_norm(seg_loss_tr)
-                loc_grad_norm = self._calculate_grad_norm(loc_loss_tr)
-                t_grad_norm = self._calculate_grad_norm(t_loss_tr)
-                n_grad_norm = self._calculate_grad_norm(n_loss_tr)
-                m_grad_norm = self._calculate_grad_norm(m_loss_tr)
+                seg_grad_norm = self._calculate_grad_norm(seg_loss_tr, "seg")
+                loc_grad_norm = self._calculate_grad_norm(loc_loss_tr, "location")
+                t_grad_norm = self._calculate_grad_norm(t_loss_tr, "t_stage")
+                n_grad_norm = self._calculate_grad_norm(n_loss_tr, "n_stage")
+                m_grad_norm = self._calculate_grad_norm(m_loss_tr, "m_stage")
                 
                 # 更新 grad norm 的 EMA
                 self._update_ema_grad_norm('seg', seg_grad_norm) # 更新 self.ema_grad_norm[key]
@@ -703,13 +703,14 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
                         # 倒數
                         norm_ratio = seg_norm / task_norm
                         # 限制權重上限
-                        self.grad_norm_factors[key] = min(norm_ratio, 5.0)
+                        self.grad_norm_factors[key] = min(norm_ratio, 3.0)
+
 
 
                 # 更新最後計算梯度範數的 epoch
                 self.last_grad_norm_update_epoch = self.current_epoch
 
-                # 每個 epoch 開始時輸出一次梯度範數和調整因子 (方便調試)
+                # 輸出梯度範數和調整因子 (方便調試)
                 if self.local_rank == 0:
                     self.print_to_log_file(f"Epoch {self.current_epoch} - Grad Norms: seg={seg_grad_norm:.4f}, "
                                           f"loc={loc_grad_norm:.4f}, t={t_grad_norm:.4f}, "
@@ -796,36 +797,58 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
             'final_loss_m': final_loss_m.detach().cpu().numpy(),
         }
 
-    def _calculate_grad_norm(self, loss):
+    def _calculate_grad_norm(self, loss, key):
         """
         計算梯度大小 (norm)
         
         當輸入的 loss 不是標量時，會先對其進行平均操作，確保它是標量
         然後通過反向傳播計算梯度，並計算所有參數梯度的 L2 範數
         """
-        # 確保損失是標量
-        if loss.dim() > 0:  # 如果損失不是標量
-            loss = loss.mean()  # 取平均值變成標量
+        # '''法一: 傳統的 loss.backward() 計算梯度並獲取梯度範數'''
+        # # 確保損失是標量
+        # if loss.dim() > 0:  # 如果損失不是標量
+        #     loss = loss.mean()  # 取平均值變成標量
             
-        # 清零梯度
-        self.optimizer.zero_grad(set_to_none=True)
+        # # 清零梯度
+        # self.optimizer.zero_grad(set_to_none=True)
         
-        # 反向傳播以計算梯度 (但不進行更新)
-        loss.backward(retain_graph=True)
-        
-        # 先裁剪梯度，然後計算範數
-        torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+        # # # 梯度計算 反向更新
+        # # # 如果有啟用混合精度(有偵測到GPU就會啟用), grad_scaler 混合精度 (AMP, fp16)
+        # # if self.grad_scaler is not None:
+        # #     self.grad_scaler.scale(loss).backward(retain_graph=True) # 縮放損失以適應 fp16 接著反向傳播
+        # #     self.grad_scaler.unscale_(self.optimizer)     # 取消縮放以獲取梯度
+        # # else:
+        # #     loss.backward(retain_graph=True)
+        # loss.backward(retain_graph=True)
 
-        # 計算梯度大小
-        grad_norm = 0.0
-        for param in self.network.parameters():
-            if param.grad is not None:
-                grad_norm += torch.sum(param.grad ** 2).item()
-        grad_norm = np.sqrt(grad_norm)
+        # # 計算梯度大小
+        # grad_norm_1 = 0.0
+        # for param in [p for p in self.network.parameters() if p.requires_grad]:
+        #     if param.grad is not None:
+        #         grad_norm_1 += torch.sum(param.grad ** 2).item()
+        # grad_norm_1 = np.sqrt(grad_norm_1)
         
-        # 清零梯度以準備下一次計算
-        self.optimizer.zero_grad(set_to_none=True)
+        # # 清零梯度以準備下一次計算
+        # self.optimizer.zero_grad(set_to_none=True)
+
+        '''法二: 使用 torch.autograd.grad 計算梯度並獲取梯度範數'''
+        # 獲取需要梯度的參數並計算梯度
+        params = [p for p in self.network.parameters() if p.requires_grad]
+        grads = torch.autograd.grad(loss, params, retain_graph=True, allow_unused=True)
         
+        # 計算梯度範數
+        grad_norm = torch.sqrt(sum(torch.norm(grad) ** 2 for grad in grads if grad is not None)).item()
+    
+        # '''檢驗兩種方法是否一致'''
+        # assert np.isclose(grad_norm, grad_norm_1), self.print_to_log_file(f"Gradient norm 不一致: {grad_norm} vs {grad_norm_1}")
+
+
+        if grad_norm > 20:
+            if self.current_epoch != 0:
+                self.print_to_log_file(f"Warning: {key} 的原始 Gradient norm 爆炸 {grad_norm} on epoch {self.current_epoch}")
+            grad_norm = 20.0  # 限制最大值，防止極端值影響穩定性
+
+
         return grad_norm
         
     def _update_ema_grad_norm(self, key, grad_norm):
@@ -1355,6 +1378,159 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
 
         self.lr_scheduler.step() # 
 
+    
+    def save_checkpoint(self, filename: str) -> None:
+        """
+        儲存訓練檢查點，包括模型權重、優化器狀態、學習率排程器狀態等。
+        覆寫父類的 save_checkpoint 方法，添加對學習率排程器狀態的保存。
+        Args:
+            filename (str): 檢查點檔案路徑
+        """
+        if self.local_rank == 0:
+            if not self.disable_checkpointing:
+                if self.is_ddp:
+                    mod = self.network.module
+                else:
+                    mod = self.network
+                if isinstance(mod, OptimizedModule):
+                    mod = mod._orig_mod
+
+                # 構建檢查點字典，包含原始內容和學習率排程器狀態
+                checkpoint = {
+                    'network_weights': mod.state_dict(),
+                    'optimizer_state': self.optimizer.state_dict(),
+                    'lr_scheduler_state': self.lr_scheduler.state_dict(),  # 添加學習率排程器狀態
+                    'grad_scaler_state': self.grad_scaler.state_dict() if self.grad_scaler is not None else None,
+                    'logging': self.logger.get_checkpoint(),
+                    '_best_ema': self._best_ema,
+                    'current_epoch': self.current_epoch + 1,
+                    'init_args': self.my_init_kwargs,
+                    'trainer_name': self.__class__.__name__,
+                    'inference_allowed_mirroring_axes': self.inference_allowed_mirroring_axes,
+                    # 多模態訓練器特有資訊
+                    'clinical_loss_manual_weights': self.clinical_loss_manual_weights if hasattr(self, 'clinical_loss_manual_weights') else None,
+                    'grad_norm_factors': self.grad_norm_factors if hasattr(self, 'grad_norm_factors') else None,
+                    'is_stage2_dataset': self.is_stage2_dataset if hasattr(self, 'is_stage2_dataset') else None,
+                }
+                torch.save(checkpoint, filename)
+            else:
+                self.print_to_log_file('No checkpoint written, checkpointing is disabled')
+
+    def load_checkpoint(self, filename_or_checkpoint: Union[dict, str]) -> None:
+        """
+        載入訓練檢查點，恢復模型權重、優化器狀態、學習率排程器狀態等。
+        覆寫父類的 load_checkpoint 方法，添加對學習率排程器狀態的載入。
+        Args:
+            filename_or_checkpoint (Union[dict, str]): 檢查點檔案路徑或已載入的檢查點字典
+        """
+        if not self.was_initialized:
+            self.initialize()
+
+        if isinstance(filename_or_checkpoint, str):
+            checkpoint = torch.load(filename_or_checkpoint, map_location=self.device, weights_only=False)
+        else:
+            checkpoint = filename_or_checkpoint
+
+        # 處理網路權重載入
+        new_state_dict = {}
+        for k, value in checkpoint['network_weights'].items():
+            key = k
+            if key not in self.network.state_dict().keys() and key.startswith('module.'):
+                key = key[7:]
+            new_state_dict[key] = value
+
+        # 載入基本資訊
+        self.my_init_kwargs = checkpoint['init_args']
+        self.current_epoch = checkpoint['current_epoch']
+        self.logger.load_checkpoint(checkpoint['logging'])
+        self._best_ema = checkpoint['_best_ema']
+        self.inference_allowed_mirroring_axes = checkpoint.get(
+            'inference_allowed_mirroring_axes', self.inference_allowed_mirroring_axes)
+
+        # 載入多模態訓練器特有資訊
+        if hasattr(self, 'clinical_loss_manual_weights') and 'clinical_loss_manual_weights' in checkpoint:
+            self.clinical_loss_manual_weights = checkpoint['clinical_loss_manual_weights']
+        
+        if hasattr(self, 'grad_norm_factors') and 'grad_norm_factors' in checkpoint:
+            self.grad_norm_factors = checkpoint['grad_norm_factors']
+        
+        if hasattr(self, 'is_stage2_dataset') and 'is_stage2_dataset' in checkpoint:
+            self.is_stage2_dataset = checkpoint['is_stage2_dataset']
+
+        # 根據模型類型載入網路權重
+        if self.is_ddp:
+            if isinstance(self.network.module, OptimizedModule):
+                self.network.module._orig_mod.load_state_dict(new_state_dict)
+            else:
+                self.network.module.load_state_dict(new_state_dict)
+        else:
+            if isinstance(self.network, OptimizedModule):
+                self.network._orig_mod.load_state_dict(new_state_dict)
+            else:
+                self.network.load_state_dict(new_state_dict)
+
+        # 載入優化器狀態
+        self.optimizer.load_state_dict(checkpoint['optimizer_state'])
+        
+        # 載入學習率排程器狀態
+        if 'lr_scheduler_state' in checkpoint and self.lr_scheduler is not None:
+            self.lr_scheduler.load_state_dict(checkpoint['lr_scheduler_state'])
+            self.print_to_log_file("學習率排程器狀態已恢復")
+            
+            # 檢查 cosine scheduler 的曲率是否正確恢復
+            self.print_to_log_file(f"[Scheduler恢復檢查] 目前 epoch={self.current_epoch}")
+            self.print_to_log_file(f"[Scheduler恢復檢查] scheduler.last_epoch={self.lr_scheduler.last_epoch}")
+            self.print_to_log_file(f"[Scheduler恢復檢查] scheduler 類型: {type(self.lr_scheduler).__name__}")
+            
+            # 檢查 scheduler 的 last_epoch 是否與 current_epoch 一致
+            expected_last_epoch = self.current_epoch - 1  # scheduler.last_epoch 通常比 current_epoch 少 1
+            if hasattr(self.lr_scheduler, 'last_epoch'):
+                if abs(self.lr_scheduler.last_epoch - expected_last_epoch) > 1:
+                    raise RuntimeError(f"Scheduler last_epoch 異常: scheduler.last_epoch={self.lr_scheduler.last_epoch}, expected={expected_last_epoch}")
+            
+            # 特別針對 cosine scheduler 檢查曲率
+            current_lr = self.optimizer.param_groups[0]['lr']
+            if 'Cosine' in type(self.lr_scheduler).__name__:
+                # 更簡單的方式：直接檢查 scheduler 執行一步後的 lr 變化
+                old_last_epoch = self.lr_scheduler.last_epoch
+                old_lr = current_lr
+                
+                # 備份當前狀態
+                scheduler_state_backup = self.lr_scheduler.state_dict()
+                
+                # 執行一步看 lr 變化
+                self.lr_scheduler.step()
+                next_lr_actual = self.optimizer.param_groups[0]['lr']
+                
+                # 還原 scheduler 和 optimizer 狀態
+                self.lr_scheduler.load_state_dict(scheduler_state_backup)
+                self.optimizer.param_groups[0]['lr'] = old_lr
+                
+                # 計算 lr 變化率
+                lr_change = abs(next_lr_actual - old_lr)
+                lr_change_ratio = lr_change / (old_lr + 1e-8)
+                
+                self.print_to_log_file(f"[Cosine曲率檢查] current_lr={old_lr:.6e}")
+                self.print_to_log_file(f"[Cosine曲率檢查] next_lr_after_step={next_lr_actual:.6e}")
+                self.print_to_log_file(f"[Cosine曲率檢查] lr_change={lr_change:.6e}")
+                self.print_to_log_file(f"[Cosine曲率檢查] lr_change_ratio={lr_change_ratio:.6f}")
+                self.print_to_log_file(f"[Cosine曲率檢查] scheduler.last_epoch after step={old_last_epoch + 1}")
+                
+                # 檢查是否從頭開始（cosine 開始時變化很小）
+                # 如果是恢復的中後期，lr 變化應該比較明顯
+                if old_last_epoch > self.num_epochs * 0.1:  # 超過 10% 的 epoch
+                    if lr_change_ratio < 0.001:  # 變化小於 0.1%
+                        self.print_to_log_file(f"[警告] Cosine scheduler 可能從頭開始！在 epoch {old_last_epoch} 時 lr 變化過小")
+                        self.print_to_log_file(f"[警告] 這可能表示 scheduler 曲率未正確恢復")
+                        # 注意：這裡不 raise error，只是警告，因為有些情況下後期 lr 變化確實很小
+                
+                self.print_to_log_file("[Cosine曲率檢查] 完成 ✓")
+            
+            self.print_to_log_file("[Scheduler恢復檢查] 通過 ✓")
+
+        # 載入梯度縮放器狀態
+        if self.grad_scaler is not None and 'grad_scaler_state' in checkpoint and checkpoint['grad_scaler_state'] is not None:
+            self.grad_scaler.load_state_dict(checkpoint['grad_scaler_state'])
 
 
     def update_clinical_loss_manual_weights(self):
@@ -1421,7 +1597,7 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
         lr_scheduler = CosineAnnealingLR(
             optimizer,
             T_max=self.num_epochs,  # 週期長度
-            eta_min=initial_lr/1000,  # 最小學習率
+            eta_min=initial_lr/1000,  # 最小學習率 # 1e-4 / 1000 = 1e-7
         )
         return optimizer, lr_scheduler
 

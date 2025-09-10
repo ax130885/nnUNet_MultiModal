@@ -3,6 +3,7 @@ import pandas as pd
 import os
 from batchgenerators.utilities.file_and_folder_operations import join, maybe_mkdir_p, subfiles, save_pickle, isfile
 # from nnunetv2.paths import nnUNet_raw, nnUNet_preprocessed
+import time
 
 class ClinicalDataLabelEncoder:
     """
@@ -71,10 +72,19 @@ class ClinicalDataLabelEncoder:
         if not isfile(self.output_csv_path):
             print(f"未找到編碼後的CSV文件，正在創建: {self.output_csv_path}")
             self.clinical_encoded_df = self.forward()
-        else:
+        if isfile(self.output_csv_path):
             print(f"找到編碼後的CSV文件: {self.output_csv_path}")
-            # 讀取已編碼的CSV文件作為參考
-            self.clinical_encoded_df = pd.read_csv(self.output_csv_path)
+            # 讀取已編碼的CSV文件
+            # 重試 5 次避免 ddp 同時讀取會錯誤
+            for attempt in range(5):
+                try:
+                    self.clinical_encoded_df = pd.read_csv(self.output_csv_path)
+                    break
+                except pd.errors.EmptyDataError:
+                    print(f"讀取失敗（EmptyDataError），第 {attempt+1} 次重試...")
+                    time.sleep(0.5)
+            else:
+                raise ValueError(f"重試 3 次後仍無法讀取: {self.output_csv_path}")
             print(f"已載入編碼後的臨床數據，形狀為: {self.clinical_encoded_df.shape}")
             
             # 檢查是否有缺失值

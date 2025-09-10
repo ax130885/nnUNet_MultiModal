@@ -601,3 +601,50 @@ if __name__ == "__main__":
             print(k, [x.shape for x in v])
 
     print("Toy training done.")
+
+
+    # ========== 參數檢查 ==========
+    print("\n" + "="*50)
+    print("模型參數結構分析")
+    print("="*50)
+    
+    all_params = list(model.parameters())
+    trainable_params_list = [p for p in model.parameters() if p.requires_grad]
+    trainable_params_set = set(trainable_params_list)  # 修正這行
+
+    total_params = sum(p.numel() for p in all_params)
+    trainable_params_count = sum(p.numel() for p in trainable_params_list)
+    frozen_params_count = total_params - trainable_params_count
+
+    print(f"總參數量: {total_params / 1e6:.2f}M")
+    print(f"可訓練參數量: {trainable_params_count / 1e6:.2f}M")
+    print(f"凍結參數量: {frozen_params_count / 1e6:.2f}M")
+    
+    if frozen_params_count > 0:
+        print("\n=== 凍結的參數層 ===")
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                print(f"  ❄️  {name:50} | {str(param.shape):20} | {param.numel()/1e3:.1f}K")
+    
+    print("\n=== 模型結構概覽 (類似 print(model)) ===")
+    def print_module_structure(module, indent=0):
+        prefix = "  " * indent
+        if list(module.children()):
+            print(f"{prefix}📦 {module.__class__.__name__}")
+            for name, child in module.named_children():
+                print(f"{prefix}  ├─ {name}: ", end="")
+                if list(child.children()):
+                    print()
+                    print_module_structure(child, indent + 2)
+                else:
+                    param_count = sum(p.numel() for p in child.parameters())
+                    trainable_count = sum(p.numel() for p in child.parameters() if p.requires_grad)
+                    status = " ✓" if trainable_count > 0 else " ❄️"
+                    print(f"{child.__class__.__name__} ({param_count/1e3:.1f}K params){status}")
+        else:
+            param_count = sum(p.numel() for p in module.parameters())
+            trainable_count = sum(p.numel() for p in module.parameters() if p.requires_grad)
+            status = " ✓" if trainable_count > 0 else " ❄️"
+            print(f"{module.__class__.__name__} ({param_count/1e3:.1f}K params){status}")
+    
+    print_module_structure(model)
