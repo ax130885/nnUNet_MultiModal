@@ -45,14 +45,12 @@ class nnUNetDatasetMultimodal(nnUNetDatasetBlosc2):
             self.clinical_df = self.clinical_full_df
 
 
-
-
         # 每個特徵 類別的數量
         self.field_specs = {
             'location': self.clinical_data_label_encoder.num_location_classes,
             't_stage':  self.clinical_data_label_encoder.num_t_stage_classes,
             'n_stage':  self.clinical_data_label_encoder.num_n_stage_classes,
-            'm_stage':  self.clinical_data_label_encoder.missing_flag_m_stage
+            'm_stage':  self.clinical_data_label_encoder.num_m_stage_classes
         }
 
         # 每個特徵的缺失標記 = 類別數量 - 1
@@ -109,7 +107,7 @@ class nnUNetDatasetMultimodal(nnUNetDatasetBlosc2):
             'n_stage':  n_idx   != self.missing_flags['n_stage'],
             'm_stage':  m_idx   != self.missing_flags['m_stage']
         }
-        
+
         return data, seg, seg_prev, properties, clinical_data_dict, clinical_mask_bool
 
 

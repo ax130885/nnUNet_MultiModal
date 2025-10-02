@@ -163,6 +163,69 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
                 self.reverse_mappings = None
                 self.missing_flags = None
 
+    def _generate_text_description(self, clinical_data_dict, clinical_mask_dict):
+        """
+        根據可用的臨床特徵生成文字描述
+        
+        Args:
+            clinical_data_dict: 包含各特徵值的字典
+            clinical_mask_dict: 包含各特徵是否有效的字典
+        
+        Returns:
+            str: 生成的文字描述
+        """
+        if not hasattr(self, 'clinical_data_label_encoder') or self.clinical_data_label_encoder is None:
+            return "A computerized tomography scan reveals a colorectal cancer."
+        
+        # 獲取反向映射表中的類別名稱
+        location_mapping = self.clinical_data_label_encoder.reverse_location_mapping
+        t_stage_mapping = self.clinical_data_label_encoder.reverse_t_stage_mapping
+        n_stage_mapping = self.clinical_data_label_encoder.reverse_n_stage_mapping
+        m_stage_mapping = self.clinical_data_label_encoder.reverse_m_stage_mapping
+        
+        # 基礎描述
+        base_text = "A computerized tomography scan reveals a colorectal cancer"
+        
+        # 收集有效的特徵描述
+        feature_descriptions = []
+        
+        # Location 描述
+        if clinical_mask_dict['location']:
+            loc_idx = clinical_data_dict['location']
+            location_name = location_mapping[loc_idx]
+            if location_name != 'Missing':
+                feature_descriptions.append(f"located in the {location_name} region")
+        
+        # T Stage 描述
+        if clinical_mask_dict['t_stage']:
+            t_idx = clinical_data_dict['t_stage']
+            t_stage_name = t_stage_mapping[t_idx]
+            if t_stage_name != 'Missing':
+                feature_descriptions.append(f"with T stage {t_stage_name}")
+        
+        # N Stage 描述
+        if clinical_mask_dict['n_stage']:
+            n_idx = clinical_data_dict['n_stage']
+            n_stage_name = n_stage_mapping[n_idx]
+            if n_stage_name != 'Missing':
+                feature_descriptions.append(f"N stage {n_stage_name}")
+        
+        # M Stage 描述
+        if clinical_mask_dict['m_stage']:
+            m_idx = clinical_data_dict['m_stage']
+            m_stage_name = m_stage_mapping[m_idx]
+            if m_stage_name != 'Missing':
+                metastasis_desc = "with distant metastasis" if m_stage_name == "M1" else "without distant metastasis"
+                feature_descriptions.append(metastasis_desc)
+        
+        # 組合描述
+        if feature_descriptions:
+            full_text = base_text + " " + ", ".join(feature_descriptions) + "."
+        else:
+            full_text = base_text + "."
+        
+        return full_text
+
     # 推論主函式
     @torch.inference_mode()
     def predict_from_data_iterator(self,
@@ -548,6 +611,29 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
         # 初始化臨床屬性預測的累加器
         prediction_cli = {k: None for k in ['location', 't_stage', 'n_stage', 'm_stage', 'missing_flags']}
 
+        # 生成文字描述（在推論階段根據臨床特徵動態生成）
+        text_descriptions = None
+        if hasattr(self, 'clinical_data_label_encoder') and self.clinical_data_label_encoder is not None:
+            # 將 tensor 轉換為標量值
+            clinical_data_dict = {
+                'location': clinical_features['location'].item(),
+                't_stage': clinical_features['t_stage'].item(),
+                'n_stage': clinical_features['n_stage'].item(),
+                'm_stage': clinical_features['m_stage'].item()
+            }
+            
+            # 生成臨床掩碼（在推論階段，我們使用原始數據）
+            clinical_mask_dict = {
+                'location': clinical_data_dict['location'] != self.missing_flags['location'],
+                't_stage': clinical_data_dict['t_stage'] != self.missing_flags['t_stage'],
+                'n_stage': clinical_data_dict['n_stage'] != self.missing_flags['n_stage'],
+                'm_stage': clinical_data_dict['m_stage'] != self.missing_flags['m_stage']
+            }
+            
+            # 生成文字描述
+            text_description = self._generate_text_description(clinical_data_dict, clinical_mask_dict)
+            text_descriptions = [text_description]  # 單個樣本的文字描述列表
+
         # ensemble 用， list_of_parameters 其實是 list of 模型權重 (長度為 fold 數量)
         for params in self.list_of_parameters:
             # 加載模型參數
@@ -562,7 +648,8 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
                 clinical_features['location'],
                 clinical_features['t_stage'],
                 clinical_features['n_stage'],
-                clinical_features['m_stage']
+                clinical_features['m_stage'],
+                text_descriptions=text_descriptions
             )
 
             # 累加預測結果
@@ -588,15 +675,16 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
         return prediction_seg, prediction_cli
 
     @torch.inference_mode()
-    def _internal_maybe_mirror_and_predict(self, x: torch.Tensor, clinical_features: dict) -> Tuple[torch.Tensor, dict]:
+    def _internal_maybe_mirror_and_predict(self, x: torch.Tensor, clinical_features: dict, text_descriptions=None) -> Tuple[torch.Tensor, dict]:
         """
-        執行鏡像增強預測（內部方法），同時考慮臨床特徵。
+        執行鏡像增強預測（內部方法），同時考慮臨床特徵和文本描述。
         根據配置決定是否使用測試時數據增強。臨床特徵不進行鏡像操作。
         
         Args:
             x (torch.Tensor): 輸入影像批次。
             clinical_features (dict): 輸入臨床特徵字典，包含四個特徵：
                                      {'location': tensor, 't_stage': tensor, 'n_stage': tensor, 'm_stage': tensor}
+            text_descriptions (list or None): 文本描述列表，可選參數，如果提供將用於文本編碼
             
         Returns:
             Tuple[torch.Tensor, dict]: 鏡像增強後的分割 logits 和臨床屬性 logits 字典。
@@ -604,13 +692,17 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
         mirror_axes = self.allowed_mirroring_axes if self.use_mirroring else None
         
         # 初始預測 (使用原始影像和臨床特徵)
-        # 根據你的模型實現方式，需要分別傳入四個臨床特徵
+        # MyMultiModel 的 forward 方法需要 text_descriptions 參數，如果沒有提供則使用 None
+        if text_descriptions is None:
+            text_descriptions = [None] * x.shape[0]  # 為批次中的每個樣本提供 None
+        
         seg_prediction, cli_prediction = self.network(
             x,
             clinical_features['location'].to(self.device),
             clinical_features['t_stage'].to(self.device),
             clinical_features['n_stage'].to(self.device),
-            clinical_features['m_stage'].to(self.device)
+            clinical_features['m_stage'].to(self.device),
+            text_descriptions=text_descriptions
         )
 
         # 處理 deep_supervision 返回的列表
@@ -641,13 +733,25 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
                 mirrored_x = torch.flip(x, axes)
 
                 # 臨床特徵不進行鏡像，直接傳遞
-                m_seg_pred, m_cli_pred = self.network(
-                    mirrored_x,
-                    clinical_features['location'].to(self.device),
-                    clinical_features['t_stage'].to(self.device),
-                    clinical_features['n_stage'].to(self.device),
-                    clinical_features['m_stage'].to(self.device)
-                )
+                if text_descriptions is not None:
+                    # 如果有文本描述，調用支援文本的模型
+                    m_seg_pred, m_cli_pred = self.network(
+                        mirrored_x,
+                        clinical_features['location'].to(self.device),
+                        clinical_features['t_stage'].to(self.device),
+                        clinical_features['n_stage'].to(self.device),
+                        clinical_features['m_stage'].to(self.device),
+                        text_descriptions=text_descriptions
+                    )
+                else:
+                    # 使用原來的調用方式
+                    m_seg_pred, m_cli_pred = self.network(
+                        mirrored_x,
+                        clinical_features['location'].to(self.device),
+                        clinical_features['t_stage'].to(self.device),
+                        clinical_features['n_stage'].to(self.device),
+                        clinical_features['m_stage'].to(self.device)
+                    )
                 
                 # 處理 deep_supervision 返回的列表
                 if isinstance(m_seg_pred, list):
@@ -679,7 +783,8 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
                                                        data: torch.Tensor,
                                                        clinical_features: dict, # 接收臨床特徵字典
                                                        slicers,
-                                                       do_on_device: bool = True):
+                                                       do_on_device: bool = True,
+                                                       text_descriptions=None):
         """
         滑動窗口預測核心實現（內部方法），支援多模態輸入。
         使用生產者-消費者模式高效處理大影像。
@@ -690,6 +795,7 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
                                      {'location': tensor, 't_stage': tensor, 'n_stage': tensor, 'm_stage': tensor}
             slicers: 滑動窗口切片器列表。
             do_on_device (bool): 是否在設備 (GPU) 上執行所有操作。
+            text_descriptions (list or None): 文本描述列表，可選參數，如果提供將用於文本編碼
             
         Returns:
             Tuple[torch.Tensor, dict]: 分割 logits 和臨床屬性 logits 字典。
@@ -699,7 +805,7 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
         
         results_device = self.device if do_on_device else torch.device('cpu') # 結果儲存設備
 
-        def producer(d, slh, q, cli_features):
+        def producer(d, slh, q, cli_features, text_descs):
             """生產者函數：將影像切片和臨床特徵放入隊列"""
             for s in slh:
                 # 將影像切片和臨床特徵複製到 GPU 並放入隊列
@@ -707,6 +813,7 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
                 q.put((
                     torch.clone(d[s][None], memory_format=torch.contiguous_format).to(self.device),
                     cli_features, # 將所有臨床特徵直接傳遞
+                    text_descs,   # 傳遞文本描述
                     s
                 ))
             q.put('end') # 結束標記
@@ -724,7 +831,7 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
 
             queue = Queue(maxsize=4) # 限制隊列大小，避免記憶體溢出
             # 啟動生產者線程
-            t = Thread(target=producer, args=(data, slicers, queue, clinical_features))
+            t = Thread(target=producer, args=(data, slicers, queue, clinical_features, text_descriptions))
             t.start()
 
             if self.verbose:
@@ -794,13 +901,13 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
                         queue.task_done()
                         break
                     
-                    workon_image, workon_cli_features, sl = item # 解包數據：影像切片、臨床特徵、切片器
+                    workon_image, workon_cli_features, workon_text_descriptions, sl = item # 解包數據：影像切片、臨床特徵、文本描述、切片器
                     
                     # 真正使用鏡像增強預測
                     # 返回的 prediction_seg 應為 (1, num_classes, D, H, W)
                     # 返回的 cli_prediction 應為 {'location': (1, num_loc_classes), ...}
                     prediction_seg_patch, cli_prediction_patch = self._internal_maybe_mirror_and_predict(
-                        workon_image, workon_cli_features
+                        workon_image, workon_cli_features, workon_text_descriptions
                     )
                     prediction_seg_patch = prediction_seg_patch.to(results_device) # 移到結果設備
 
@@ -920,10 +1027,10 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
         return predicted_logits_seg, predicted_logits_cli
 
     @torch.inference_mode()
-    def predict_sliding_window_return_logits(self, data: torch.Tensor, loc: torch.Tensor, t: torch.Tensor, n: torch.Tensor, m: torch.Tensor):
+    def predict_sliding_window_return_logits(self, data: torch.Tensor, loc: torch.Tensor, t: torch.Tensor, n: torch.Tensor, m: torch.Tensor, text_descriptions=None):
         """
         使用滑動窗口方法進行預測，返回原始 logits（用於驗證）。
-        支持多模態數據輸入（影像 + 臨床特徵）。
+        支持多模態數據輸入（影像 + 臨床特徵 + 文本描述）。
         
         Args:
             data (torch.Tensor): 影像數據，形狀為 [C, X, Y, Z]
@@ -931,6 +1038,7 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
             t (torch.Tensor): T 分期特徵，形狀為 [1]
             n (torch.Tensor): N 分期特徵，形狀為 [1]
             m (torch.Tensor): M 分期特徵，形狀為 [1]
+            text_descriptions (list or None): 文本描述列表，可選參數，如果提供將用於文本編碼
             
         Returns:
             Tuple[torch.Tensor, dict]: 分割預測 logits 和臨床屬性預測 logits
@@ -1001,13 +1109,13 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
             # 執行預測
             try:
                 predicted_seg_logits, predicted_cli_logits = self._internal_predict_sliding_window_return_logits(
-                    padded_data, clinical_features, slicers, self.perform_everything_on_device
+                    padded_data, clinical_features, slicers, self.perform_everything_on_device, text_descriptions
                 )
             except RuntimeError:
                 print('在設備上預測失敗，可能是由於記憶體不足。將結果數組移至 CPU')
                 empty_cache(self.device)
                 predicted_seg_logits, predicted_cli_logits = self._internal_predict_sliding_window_return_logits(
-                    padded_data, clinical_features, slicers, False
+                    padded_data, clinical_features, slicers, False, text_descriptions
                 )
 
             # 移除填充區域：將分割 logits 恢復到原始影像尺寸
@@ -1226,7 +1334,7 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
         if ('nnUNet_compile' in os.environ and
                 os.environ['nnUNet_compile'].lower() in ('true', '1', 't') and
                 not isinstance(self.network, OptimizedModule)):
-            print('啟用 torch.compile 加速')
+            print('啟用 torch.compile 加速（排除文字編碼器）')
             self.network = torch.compile(self.network)
 
     # 直接 super 原生 predictor 方法 (沒改)

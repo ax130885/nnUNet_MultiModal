@@ -95,8 +95,6 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
             print(f"logger種類為: {type(self.logger)}")
             print("nnUNetTrainerMultimodal 初始化完成。")
 
-
-
     def initialize(self):
         """
         初始化模型、優化器、學習率排程器、損失函數和資料集類別。
@@ -182,7 +180,7 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
             # 編譯網路 (如果支援且啟用)
             if self._do_i_compile():
                 if self.local_rank == 0:
-                    self.print_to_log_file('使用 torch.compile...')
+                    self.print_to_log_file('使用 torch.compile（排除文字編碼器）...')
                 self.network = torch.compile(self.network)
 
             # 配置優化器和學習率排程器
@@ -578,8 +576,9 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
         clinical_data_aug = batch['clinical_data_aug']      # 增強後的資料 (用於模型輸入)
         clinical_data_label = batch['clinical_data_label']  # 原始資料 (用於計算loss)
         clinical_mask = batch['clinical_mask']              # mask
-        keys = batch['keys']
-
+        keys = batch['keys']                                # [B] list of identifiers
+        text_descriptions = batch['text_descriptions']     # [B] list of text descriptions
+    
         # 將影像數據和seg label移動到指定設備
         image_data = img_data.to(self.device, non_blocking=True)
         if isinstance(seg_target, list): # 如果有多種分割目標器官
@@ -611,7 +610,7 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
         with torch.autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else self.dummy_context():
             # 模型前向傳播：輸入影像和臨床特徵
             # MyMultiModel 返回 seg_out, cli_out
-            seg_out, cli_out = self.network(image_data, loc_input, t_input, n_input, m_input)
+            seg_out, cli_out = self.network(image_data, loc_input, t_input, n_input, m_input, text_descriptions)
 
             # --- 計算分割損失 ---
             seg_loss_tr = self.loss(seg_out, seg_target)
@@ -992,6 +991,7 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
         clinical_data_label = batch['clinical_data_label']   # 原始資料 (用於計算loss)
         clinical_mask = batch['clinical_mask']               # mask
         keys = batch['keys']
+        text_descriptions = batch['text_descriptions']      # [B] list of text descriptions
 
         # 將影像數據和seg label移動到指定設備
         image_data = img_data.to(self.device, non_blocking=True)
@@ -1021,7 +1021,7 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
         # 推論結果
         # Autocast 只在 CUDA 上啟用，CPU/MPS 不啟用以避免效能低落或報錯
         with torch.autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else self.dummy_context():
-            seg_out, cli_out = self.network(image_data, loc_input, t_input, n_input, m_input)
+            seg_out, cli_out = self.network(image_data, loc_input, t_input, n_input, m_input, text_descriptions)
             # 釋放 image_data 記憶體，減少顯存佔用 (臨床特徵 還要計算指標用 別刪)
             del image_data
 
@@ -1761,6 +1761,7 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
                         'n_stage': False,
                         'm_stage': False
                     }
+                    text_description = None
 
                 # 將 Blosc2 數據 (如果適用) 轉換為 NumPy 陣列
                 image_data_np = image_data_np[:]
@@ -1794,6 +1795,23 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
                 n_mask = torch.tensor(clinical_mask['n_stage']).to(self.device, non_blocking=True)
                 m_mask = torch.tensor(clinical_mask['m_stage']).to(self.device, non_blocking=True)
 
+                # 生成文字描述（用於驗證）
+                text_descriptions = None
+                if self.is_stage2_dataset:
+                    # 創建一個臨時的多模態 DataLoader 來使用其 generate_text_description 方法
+                    # 在驗證階段，我們使用原始數據（沒有 dropout）
+                    temp_loader = nnUNetDataLoaderMultimodal(
+                        dataset_val,
+                        1,  # batch_size=1 足夠用於生成文字描述
+                        self.configuration_manager.patch_size,
+                        self.configuration_manager.patch_size,
+                        self.label_manager
+                    )
+                    text_description = temp_loader.generate_text_description(clinical_data, clinical_mask)
+                    text_descriptions = [text_description]  # predictor 期望接收列表
+                else:
+                    text_descriptions = None
+
 
 
                 self.print_to_log_file(f'案例 {k}, 影像形狀 {image_data_tensor.shape}, 當前 rank {self.local_rank}')
@@ -1803,7 +1821,7 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
                 # **使用 nnUNetPredictorMultimodal 執行滑動視窗預測**
                 # 它會同時返回分割的 logits 和臨床屬性預測的 logits
                 prediction_seg_logits, prediction_cli_logits = predictor.predict_sliding_window_return_logits(
-                    image_data_tensor, loc_label, t_label, n_label, m_label
+                    image_data_tensor, loc_label, t_label, n_label, m_label, text_descriptions=text_descriptions
                 )
                 prediction_seg_logits = prediction_seg_logits.cpu() # 將分割結果移動到 CPU
                

@@ -6,10 +6,35 @@ from torch import nn
 from torch.nn.modules.instancenorm import InstanceNorm3d
 from torch.nn.modules.activation import LeakyReLU
 from nnunetv2.preprocessing.clinical_data_label_encoder import ClinicalDataLabelEncoder
-
+from sentence_transformers import SentenceTransformer
 
 import matplotlib.pyplot as plt
 import numpy as np
+
+
+class TextEncoderModule(nn.Module):
+    """
+    獨立的文字編碼模組，使用 torch._dynamo.disable 避免被編譯
+    """
+    def __init__(self, freeze_bert: bool = True):
+        super().__init__()
+        self.sentence_transformer = SentenceTransformer("neuml/pubmedbert-base-embeddings")
+        
+        # 凍結權重
+        if freeze_bert:
+            for param in self.sentence_transformer.parameters():
+                param.requires_grad = False
+    
+    @torch._dynamo.disable  # 這是關鍵：告訴 torch.compile 不要編譯這個方法
+    def forward(self, text_descriptions):
+        """
+        對文字描述進行編碼，此方法不會被 torch.compile 編譯
+        """
+        embeddings = self.sentence_transformer.encode(
+            text_descriptions, 
+            convert_to_tensor=True
+        )
+        return embeddings.detach()
 
 
 class FiLMAddFusion(nn.Module):
@@ -174,7 +199,8 @@ class MyMultiModel(nn.Module):
                  input_channels: int = 1,
                  num_classes: int = 2,
                  deep_supervision: bool = True,
-                 clinical_csv_dir: str = '/home/admin/yuxin/data/Lab/model/UNet_base/nnunet_ins_data/data_test/nnUNet_raw/Dataset101'):
+                 clinical_csv_dir: str = '/home/admin/yuxin/data/Lab/model/UNet_base/nnunet_ins_data/data_test/nnUNet_raw/Dataset101',
+                 freeze_bert: bool = True):
         super().__init__()
         self.input_channels = input_channels
         self.num_classes = num_classes
@@ -186,6 +212,7 @@ class MyMultiModel(nn.Module):
                 self.deep_supervision = deep_supervision
         self.decoder = _DummyDecoder(self.deep_supervision)
 
+        ## label encoder
         encoder = ClinicalDataLabelEncoder(clinical_csv_dir)
 
         # 讀取臨床資料的類別數
@@ -199,6 +226,14 @@ class MyMultiModel(nn.Module):
         self.missing_flag_t_stage = encoder.missing_flag_t_stage # 5
         self.missing_flag_n_stage = encoder.missing_flag_n_stage # 3
         self.missing_flag_m_stage = encoder.missing_flag_m_stage # 2
+
+
+
+
+        # ---------- 文字編碼器 ----------
+        # 創建獨立的文字編碼模組，不會被 torch.compile 編譯
+        self.text_encoder = TextEncoderModule(freeze_bert)
+
 
         # ---------- 影像編碼器 ----------
         self.encoder_stages = nn.ModuleList()
@@ -253,12 +288,22 @@ class MyMultiModel(nn.Module):
         self.emb_n   = nn.Embedding(self.num_n_stage_classes, 8, padding_idx=self.missing_flag_n_stage)
         self.emb_m   = nn.Embedding(self.num_m_stage_classes, 8, padding_idx=self.missing_flag_m_stage)
 
-        # 臨床特徵投影層，將所有embedding concate 後(dim=8*4)投影到與影像瓶頸層(dim=320)相同的通道數
-        self.clinical_expand = nn.Sequential(
-            nn.Linear(8 * 4, 256), # 8是每個嵌入的維度，4是臨床特徵的數量
-            nn.LeakyReLU(inplace=True),
-            nn.Linear(256, 320) # 輸出維度與影像編碼器瓶頸層通道數一致
+        # text_descriptions 投影層 - 改進版
+        self.text_expand = nn.Sequential(
+            nn.Linear(768, 512),
+            nn.LayerNorm(512),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(512, 320),
+            nn.LayerNorm(320)
         )
+        
+        # # 臨床特徵投影層，將所有embedding concate 後(dim=8*4)投影到與影像瓶頸層(dim=320)相同的通道數
+        # self.clinical_expand = nn.Sequential(
+        #     nn.Linear(8 * 4, 256), # 8是每個嵌入的維度，4是臨床特徵的數量
+        #     nn.LeakyReLU(inplace=True),
+        #     nn.Linear(256, 320) # 輸出維度與影像編碼器瓶頸層通道數一致
+        # )
 
 
         # ---------- 門控混合 跳躍連結(skip)與臨床特徵 ----------
@@ -395,7 +440,7 @@ class MyMultiModel(nn.Module):
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
 
-    def forward(self, img, loc, t, n, m):
+    def forward(self, img, loc, t, n, m, text_descriptions):
         """
         Args: 輸入模型時 需要全部為 tensor
             img:          [B, C, D, H, W]
@@ -403,6 +448,7 @@ class MyMultiModel(nn.Module):
             t:            [B]  整數索引 (含 Missing 索引)
             n:            [B]  整數索引 (含 Missing 索引)
             m:            [B]  整數索引 (含 Missing 索引)
+            text_descriptions:     [B]  文字描述列表
         Returns:
             seg_out:       [B, C, D, H, W] 分割頭
             cli_out:       dict 包含臨床資料分類頭輸出
@@ -426,13 +472,20 @@ class MyMultiModel(nn.Module):
             i += 1
         bottleneck = skips[-1]
 
-        # ---------- 臨床 Embedding ----------
-        loc_emb = self.emb_loc(loc) # [B] -> [B, C=8]
-        t_emb   = self.emb_t(t)
-        n_emb   = self.emb_n(n)
-        m_emb   = self.emb_m(m)
-        clinical_vec = torch.cat([loc_emb, t_emb, n_emb, m_emb], dim=1) # [B, C=8] -> [B, 8*4]
-        clinical_feat = self.clinical_expand(clinical_vec) # [B, 8*4] -> [B, 320] (符合瓶頸層維度)
+        # # ---------- 臨床 Embedding ----------
+        # loc_emb = self.emb_loc(loc) # [B] -> [B, C=8]
+        # t_emb   = self.emb_t(t)
+        # n_emb   = self.emb_n(n)
+        # m_emb   = self.emb_m(m)
+        # clinical_vec = torch.cat([loc_emb, t_emb, n_emb, m_emb], dim=1) # [B, C=8] -> [B, 8*4]
+        # clinical_feat = self.clinical_expand(clinical_vec) # [B, 8*4] -> [B, 320] (符合瓶頸層維度)
+
+        # ---------- 文字 Embedding ----------
+        # 使用獨立的文字編碼模組，不會被 torch.compile 編譯
+        text_embeddings = self.text_encoder(text_descriptions) # [B, 768]
+        text_embeddings = text_embeddings.to(img.device) # 確保與模型在同一設備上
+        clinical_feat = self.text_expand(text_embeddings) # [B, 768] -> [B, 320] (符合瓶頸層維度)
+
 
         # ---------- 融合 ----------
         fused_skips = []
@@ -552,6 +605,12 @@ if __name__ == "__main__":
     t = torch.tensor([3, 1]).to(device)    # B 1，batch 1 輸入 3，batch 2 輸入 1
     n = torch.tensor([2, 0]).to(device)    # B 1，batch 1 輸入 2，batch 2 輸入 0
     m = torch.tensor([1, 0]).to(device)    # B 1，batch 1 輸入 1，batch 2 輸入 0
+    
+    # 文字描述 (訓練用假資料)
+    text_descriptions_train = [
+        "A computerized tomography scan reveals a colorectal cancer.",
+        "A computerized tomography scan reveals a colorectal cancer."
+    ]
 
     # 假 GT（分割與臨床標籤都用 0/1 隨便填）
     seg_gt = torch.randint(0, 2, (2, 64, 64, 64)).long().to(device)  # 與最終層同空間尺寸
@@ -570,7 +629,7 @@ if __name__ == "__main__":
     for epoch in range(1, epochs+1):
         optimizer.zero_grad()
 
-        seg_out, cli_out = model(img, loc, t, n, m)  # 前向傳播
+        seg_out, cli_out = model(img, loc, t, n, m, text_descriptions_train)  # 前向傳播
 
         # 分割 loss：取最後一層（關閉 deep_supervision 時）
         if isinstance(seg_out, list):
@@ -593,7 +652,7 @@ if __name__ == "__main__":
     # -------------------- 推論示範 --------------------
     with torch.no_grad():
         model.eval()
-        seg_out, cli_out = model(img, loc, t, n, m)  # 前向傳播
+        seg_out, cli_out = model(img, loc, t, n, m, text_descriptions_train)  # 前向傳播
         print("\n=== eval shapes ===")
         for seg in (seg_out if isinstance(seg_out, list) else [seg_out]):
             print("seg:", seg.shape)
@@ -648,3 +707,71 @@ if __name__ == "__main__":
             print(f"{module.__class__.__name__} ({param_count/1e3:.1f}K params){status}")
     
     print_module_structure(model)
+
+    # ========== 完整輸入範例 (包含文字描述) ==========
+    print("\n" + "="*50)
+    print("完整輸入範例測試 (包含文字描述)")
+    print("="*50)
+    
+    # 重新建立模型實例，確保乾淨狀態
+    model_test = MyMultiModel(input_channels=1, num_classes=2).to(device)
+    
+    # 準備完整輸入數據
+    batch_size = 2
+    img_test = torch.randn(batch_size, 1, 64, 64, 64).to(device)  # [B, C, D, H, W]
+    
+    # 臨床特徵 (確保在有效範圍內)
+    loc_test = torch.tensor([2, 5]).to(device)  # location indices
+    t_test = torch.tensor([1, 3]).to(device)    # t_stage indices  
+    n_test = torch.tensor([0, 2]).to(device)    # n_stage indices
+    m_test = torch.tensor([0, 1]).to(device)    # m_stage indices
+    
+    # 文字描述範例
+    text_descriptions = [
+        "A computerized tomography scan reveals a colorectal cancer located in the rectum region, with T stage T2, N stage N0, without distant metastasis.",
+        "A computerized tomography scan reveals a colorectal cancer located in the sigmoid colon region, with T stage T4, N stage N2, with distant metastasis."
+    ]
+    
+    print(f"輸入形狀檢查:")
+    print(f"  - 影像: {img_test.shape}")
+    print(f"  - Location: {loc_test.shape} -> {loc_test.tolist()}")
+    print(f"  - T_stage: {t_test.shape} -> {t_test.tolist()}")
+    print(f"  - N_stage: {n_test.shape} -> {n_test.tolist()}")
+    print(f"  - M_stage: {m_test.shape} -> {m_test.tolist()}")
+    print(f"  - 文字描述數量: {len(text_descriptions)}")
+    
+    # 測試前向傳播
+    model_test.eval()
+    with torch.no_grad():
+        try:
+            seg_pred, cli_pred = model_test(img_test, loc_test, t_test, n_test, m_test, text_descriptions)
+            
+            print(f"\n✅ 模型前向傳播成功!")
+            print(f"分割輸出形狀:")
+            if isinstance(seg_pred, list):
+                for i, seg in enumerate(seg_pred):
+                    print(f"  - 層 {i}: {seg.shape}")
+            else:
+                print(f"  - {seg_pred.shape}")
+            
+            print(f"臨床預測輸出形狀:")
+            for feature, predictions in cli_pred.items():
+                print(f"  - {feature}:")
+                for i, pred in enumerate(predictions):
+                    print(f"    層 {i}: {pred.shape}")
+            
+            # 顯示預測結果
+            print(f"\n預測結果範例 (最後一層):")
+            print(f"  Location 預測機率分佈: {torch.softmax(cli_pred['location'][-1], dim=1)}")
+            print(f"  T_stage 預測機率分佈: {torch.softmax(cli_pred['t_stage'][-1], dim=1)}")
+            print(f"  N_stage 預測機率分佈: {torch.softmax(cli_pred['n_stage'][-1], dim=1)}")
+            print(f"  M_stage 預測機率分佈: {torch.softmax(cli_pred['m_stage'][-1], dim=1)}")
+            
+        except Exception as e:
+            print(f"❌ 模型前向傳播失敗: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    print("\n" + "="*50)
+    print("測試完成!")
+    print("="*50)

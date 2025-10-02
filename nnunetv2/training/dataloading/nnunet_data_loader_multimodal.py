@@ -29,7 +29,7 @@ class nnUNetDataLoaderMultimodal(nnUNetDataLoader):
                  probabilistic_oversampling: bool = False,
                  transforms=None,
                  clinical_drop_probability_global: float = 0.35,
-                 clinical_drop_probability_column: float = 0.35
+                 clinical_drop_probability_column: float = 0.3
                  ):
         """
         初始化多模態資料載入器。
@@ -53,6 +53,66 @@ class nnUNetDataLoaderMultimodal(nnUNetDataLoader):
         self.clinical_data_label_encoder = data.clinical_data_label_encoder
         self.missing_flags = data.missing_flags # 這是你提供的字典
         print(f"nnUNetDataLoaderMultimodal 初始化完成。有效類別數量=缺失標記: {self.missing_flags}")
+
+    def generate_text_description(self, clinical_data_dict, clinical_mask_dict):
+        """
+        根據可用的臨床特徵生成文字描述
+        
+        Args:
+            clinical_data_dict: 包含各特徵值的字典
+            clinical_mask_dict: 包含各特徵是否有效的字典
+        
+        Returns:
+            str: 生成的文字描述
+        """
+        # 獲取反向映射表中的類別名稱
+        location_mapping = self.clinical_data_label_encoder.reverse_location_mapping
+        t_stage_mapping = self.clinical_data_label_encoder.reverse_t_stage_mapping
+        n_stage_mapping = self.clinical_data_label_encoder.reverse_n_stage_mapping
+        m_stage_mapping = self.clinical_data_label_encoder.reverse_m_stage_mapping
+        
+        # 基礎描述
+        base_text = "A computerized tomography scan reveals a colorectal cancer"
+        
+        # 收集有效的特徵描述
+        feature_descriptions = []
+        
+        # Location 描述
+        if clinical_mask_dict['location']:
+            loc_idx = clinical_data_dict['location']
+            location_name = location_mapping[loc_idx]
+            if location_name != 'Missing':
+                feature_descriptions.append(f"located in the {location_name} region")
+        
+        # T Stage 描述
+        if clinical_mask_dict['t_stage']:
+            t_idx = clinical_data_dict['t_stage']
+            t_stage_name = t_stage_mapping[t_idx]
+            if t_stage_name != 'Missing':
+                feature_descriptions.append(f"with T stage {t_stage_name}")
+        
+        # N Stage 描述
+        if clinical_mask_dict['n_stage']:
+            n_idx = clinical_data_dict['n_stage']
+            n_stage_name = n_stage_mapping[n_idx]
+            if n_stage_name != 'Missing':
+                feature_descriptions.append(f"N stage {n_stage_name}")
+        
+        # M Stage 描述
+        if clinical_mask_dict['m_stage']:
+            m_idx = clinical_data_dict['m_stage']
+            m_stage_name = m_stage_mapping[m_idx]
+            if m_stage_name != 'Missing':
+                metastasis_desc = "with distant metastasis" if m_stage_name == "M1" else "without distant metastasis"
+                feature_descriptions.append(metastasis_desc)
+        
+        # 組合描述
+        if feature_descriptions:
+            full_text = base_text + " " + ", ".join(feature_descriptions) + "."
+        else:
+            full_text = base_text + "."
+        
+        return full_text
 
     def generate_train_batch(self):
         """
@@ -157,6 +217,23 @@ class nnUNetDataLoaderMultimodal(nnUNetDataLoader):
 
         # --- 結束新增 ---
 
+        # --- 根據 drop 後的特徵生成文字描述 ---
+        text_descriptions = []
+        for b in range(batch_size):
+            # 為每個樣本生成對應的特徵字典和 mask
+            sample_clinical_data = {k: clinical_data_aug[k][b] for k in clinical_data_aug.keys()}
+            sample_clinical_mask = {}
+            
+            # 檢查每個特徵是否被 drop（即是否等於缺失標記）
+            for k in clinical_data_aug.keys():
+                # 如果原本有效且沒有被 drop 為缺失標記，則認為有效
+                is_not_dropped = clinical_data_aug[k][b] != self.missing_flags[k]
+                sample_clinical_mask[k] = clinical_mask_final[k][b] and is_not_dropped
+            
+            # 生成文字描述
+            text_desc = self.generate_text_description(sample_clinical_data, sample_clinical_mask)
+            text_descriptions.append(text_desc)
+
         # 回傳結構
         return {
             'data': data_all,                    # [B, C, D, H, W] tensor
@@ -164,7 +241,8 @@ class nnUNetDataLoaderMultimodal(nnUNetDataLoader):
             'clinical_data_aug': clinical_data_aug,      # 增強後的臨床資料 (模型輸入)
             'clinical_data_label': clinical_data_label,  # 原始臨床資料 (計算loss用)
             'clinical_mask': clinical_mask_final,        # 臨床資料 mask
-            'keys': selected_keys                        # [B] list of identifiers
+            'keys': selected_keys,                        # [B] list of identifiers
+            'text_descriptions': text_descriptions        # 文字描述列表
         }
 
 if __name__ == "__main__":
@@ -195,3 +273,4 @@ if __name__ == "__main__":
     print("Input (dropped):", batch['clinical_data_aug'])
     print("Mask (unchanged):", batch['clinical_mask'])
     print("Keys:", batch['keys'])
+    print("Text descriptions:", batch['text_descriptions'])
