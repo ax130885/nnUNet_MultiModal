@@ -15,6 +15,8 @@ import numpy as np
 class TextEncoderModule(nn.Module):
     """
     獨立的文字編碼模組，使用 torch._dynamo.disable 避免被編譯
+    
+    重要：BERT 權重已凍結，但會創建可訓練的輸出副本供下游層使用
     """
     def __init__(self, freeze_bert: bool = True):
         super().__init__()
@@ -24,110 +26,162 @@ class TextEncoderModule(nn.Module):
         if freeze_bert:
             for param in self.sentence_transformer.parameters():
                 param.requires_grad = False
+            # 設置為 eval 模式（這是關鍵！）
+            self.sentence_transformer.eval()
     
-    @torch._dynamo.disable  # 這是關鍵：告訴 torch.compile 不要編譯這個方法
+    @torch._dynamo.disable
     def forward(self, text_descriptions):
         """
-        對文字描述進行編碼，此方法不會被 torch.compile 編譯
+        對文字描述進行編碼
+        
+        策略：
+        1. BERT 在 no_grad 下執行（省記憶體，完全凍結）
+        2. 創建新的 tensor 副本，允許下游層訓練
         """
-        embeddings = self.sentence_transformer.encode(
-            text_descriptions, 
-            convert_to_tensor=True
-        )
-        return embeddings.detach()
-
-
-class ASPP3D(nn.Module):
-    """
-    3D Atrous Spatial Pyramid Pooling (ASPP) 模塊
-    使用不同的膨脹率來捕獲多尺度上下文信息
-    """
-    def __init__(self, in_channels: int, out_channels: int, rates: list = [1, 2, 3, 4]):
-        super().__init__()
-        
-        # 1x1x1 卷積分支
-        self.conv1 = nn.Sequential(
-            nn.Conv3d(in_channels, out_channels, 1, bias=False),
-            InstanceNorm3d(out_channels),
-            nn.LeakyReLU(0.01, inplace=True)
-        )
-        
-        # 多個膨脹卷積分支
-        self.atrous_convs = nn.ModuleList()
-        for rate in rates:
-            self.atrous_convs.append(
-                nn.Sequential(
-                    nn.Conv3d(in_channels, out_channels, 3, 
-                             padding=rate, dilation=rate, bias=False),
-                    InstanceNorm3d(out_channels),
-                    nn.LeakyReLU(0.01, inplace=True)
-                )
+        # 使用 no_grad 明確告訴 PyTorch 不追蹤 BERT 的計算圖
+        with torch.no_grad():
+            embeddings = self.sentence_transformer.encode(
+                text_descriptions, 
+                convert_to_tensor=True
             )
         
-        # 全局平均池化分支
-        # 注意：池化後是 [B, C, 1, 1, 1]，不能使用 InstanceNorm3d（需要 >1 空間元素）
-        self.global_avg_pool = nn.Sequential(
-            nn.AdaptiveAvgPool3d(1),
-            nn.Conv3d(in_channels, out_channels, 1, bias=True),  # 使用 bias 補償沒有 norm
-            nn.LeakyReLU(0.01, inplace=True)
+        # 創建一個全新的 tensor，數據相同但可以參與梯度計算
+        # 這樣 BERT 完全不參與反向傳播，但下游層可以訓練
+        return embeddings.clone().detach().requires_grad_()
+
+
+class CrossAttentionFusion(nn.Module):
+    """
+    使用 Cross Attention 機制融合影像特徵和臨床特徵
+    適用於影像分割任務：
+    - 影像特徵: [B, C, D, H, W] 保留空間資訊
+    - 臨床特徵: [B, cli_dim] 全局語義資訊
+    
+    策略改進：讓每個空間位置自適應地決定需要多少臨床資訊
+    - 影像特徵作為 Query（詢問：我需要什麼臨床資訊？）
+    - 臨床特徵作為 Key/Value（提供：這些是可用的臨床資訊）
+    """
+    def __init__(self, channels: int, cli_dim: int = 320, num_heads: int = 8, dropout: float = 0.1):
+        super().__init__()
+        self.channels = channels
+        self.num_heads = num_heads
+        self.head_dim = channels // num_heads
+        
+        assert channels % num_heads == 0, f"channels ({channels}) 必須能被 num_heads ({num_heads}) 整除"
+        
+        # 影像特徵投影 (作為 Query)
+        self.img_query = nn.Conv3d(channels, channels, 1)
+        
+        # 臨床特徵投影 (作為 Key 和 Value)
+        # 將單一臨床向量擴展為多個"專家"，每個專家關注不同的臨床aspect
+        self.num_clinical_tokens = 4  # 臨床資訊分解為4個token
+        self.cli_key = nn.Sequential(
+            nn.Linear(cli_dim, channels * self.num_clinical_tokens),
+            nn.LayerNorm(channels * self.num_clinical_tokens)
+        )
+        self.cli_value = nn.Sequential(
+            nn.Linear(cli_dim, channels * self.num_clinical_tokens),
+            nn.LayerNorm(channels * self.num_clinical_tokens)
         )
         
-        # 融合所有分支後的投影層
-        # 總共有: 1個1x1卷積 + len(rates)個膨脹卷積 + 1個全局池化 = len(rates)+2 個分支
-        total_branches = len(rates) + 2
-        self.project = nn.Sequential(
-            nn.Conv3d(out_channels * total_branches, out_channels, 1, bias=False),
-            InstanceNorm3d(out_channels),
-            nn.LeakyReLU(0.01, inplace=True),
-            nn.Dropout3d(0.1)
+        # 輸出投影
+        self.out_proj = nn.Conv3d(channels, channels, 1)
+        
+        # Dropout
+        self.attn_dropout = nn.Dropout(dropout)
+        self.proj_dropout = nn.Dropout(dropout)
+        
+        # 後處理：融合原始影像特徵與注意力結果
+        self.fusion_conv = nn.Sequential(
+            nn.Conv3d(channels * 2, channels, 3, padding=1),
+            InstanceNorm3d(channels),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Conv3d(channels, channels, 3, padding=1),
+            InstanceNorm3d(channels)
         )
         
-        # 初始化權重
+        # 縮放因子
+        self.scale = self.head_dim ** -0.5
+        
         self.apply(self._init_weights)
     
     def _init_weights(self, m):
-        if isinstance(m, nn.Conv3d):
+        """初始化權重"""
+        if isinstance(m, (nn.Conv3d, nn.Linear)):
             nn.init.kaiming_normal_(m.weight, nonlinearity='leaky_relu', a=0.01)
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
-        elif isinstance(m, InstanceNorm3d):
+        elif isinstance(m, (InstanceNorm3d, nn.LayerNorm)):
             if m.weight is not None:
                 nn.init.constant_(m.weight, 1)
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
     
-    def forward(self, x):
+    def forward(self, img_feat, cli_feat):
         """
-        x: [B, C, D, H, W]
+        img_feat : [B, C, D, H, W]  影像空間特徵
+        cli_feat : [B, cli_dim]     臨床全局特徵
+        
+        改進策略：
+        1. 影像每個空間位置作為 Query
+        2. 臨床特徵擴展為多個 token 作為 Key/Value
+        3. 每個位置自適應地從臨床 tokens 中提取相關資訊
         """
-        # 保存輸入的空間尺寸
-        size = x.shape[2:]
+        B, C, D, H, W = img_feat.shape
+        spatial_size = D * H * W
         
-        # 1x1 卷積分支
-        feat1 = self.conv1(x)
+        # 1. 影像特徵投影為 Query (每個空間位置都是一個 query)
+        query = self.img_query(img_feat)  # [B, C, D, H, W]
+        # 重塑為 multi-head 格式
+        # [B, C, D, H, W] -> [B, num_heads, head_dim, D*H*W]
+        query = query.view(B, self.num_heads, self.head_dim, spatial_size)
         
-        # 膨脹卷積分支
-        atrous_feats = [conv(x) for conv in self.atrous_convs]
+        # 2. 臨床特徵投影為多個 Key 和 Value tokens
+        key_raw = self.cli_key(cli_feat)      # [B, C * num_tokens]
+        value_raw = self.cli_value(cli_feat)  # [B, C * num_tokens]
         
-        # 全局平均池化分支
-        global_feat = self.global_avg_pool(x)
-        # 上採樣到原始尺寸
-        global_feat = torch.nn.functional.interpolate(
-            global_feat, size=size, mode='trilinear', align_corners=False
-        )
+        # 重塑為 multi-head 格式
+        # [B, C * num_tokens] -> [B, num_heads, head_dim, num_tokens]
+        key = key_raw.view(B, self.num_heads, self.head_dim, self.num_clinical_tokens)
+        value = value_raw.view(B, self.num_heads, self.head_dim, self.num_clinical_tokens)
         
-        # 拼接所有分支
-        concat_feats = torch.cat([feat1] + atrous_feats + [global_feat], dim=1)
+        # 3. 計算 Attention scores
+        # query:  [B, num_heads, head_dim, D*H*W]
+        # key:    [B, num_heads, head_dim, num_tokens]
+        # scores: [B, num_heads, D*H*W, num_tokens]
+        attn_scores = torch.matmul(query.transpose(-2, -1), key) * self.scale
         
-        # 投影到輸出維度
-        out = self.project(concat_feats)
+        # 在臨床 tokens 維度上做 softmax
+        # 每個空間位置決定從哪些臨床 tokens 獲取資訊
+        attn_weights = torch.softmax(attn_scores, dim=-1)  # [B, num_heads, D*H*W, num_tokens]
+        attn_weights = self.attn_dropout(attn_weights)
+        
+        # 4. 應用 Attention 到 Value
+        # attn_weights: [B, num_heads, D*H*W, num_tokens]
+        # value:        [B, num_heads, head_dim, num_tokens]
+        # attn_output:  [B, num_heads, head_dim, D*H*W]
+        attn_output = torch.matmul(value, attn_weights.transpose(-2, -1))
+        
+        # 5. 重塑回空間形狀
+        # [B, num_heads, head_dim, D*H*W] -> [B, C, D, H, W]
+        attn_output = attn_output.contiguous().view(B, C, D, H, W)
+        attn_output = self.out_proj(attn_output)
+        attn_output = self.proj_dropout(attn_output)
+        
+        # 6. 融合原始影像特徵與注意力增強特徵
+        fused = torch.cat([img_feat, attn_output], dim=1)  # [B, 2C, D, H, W]
+        out = self.fusion_conv(fused)  # [B, C, D, H, W]
+        
+        # 7. 殘差連接
+        out = out + img_feat
         
         return out
 
 
 class FiLMAddFusion(nn.Module):
     """
-    用 FiLM 把臨床向量變成 γ、β，對影像 feature 做逐通道仿射變換。
+    用 FiLM 把臨床向量變成 γ、β,對影像 feature 做逐通道仿射變換。
     變換後的 feature 再與 skip 連接的 feature **concat**（不改 nnUNet 邏輯）。
     """
     def __init__(self, channels: int, cli_dim: int):
@@ -193,8 +247,6 @@ class FiLMAddFusion(nn.Module):
         # 4. 後處理 + 残差
         out = x + self.final_fusion(x)
         return out
-    
-
 
 class GatedFusion(nn.Module):
     def __init__(self, channels: int):
@@ -318,9 +370,9 @@ class MyMultiModel(nn.Module):
 
 
 
-        # # ---------- 文字編碼器 ----------
-        # # 創建獨立的文字編碼模組，不會被 torch.compile 編譯
-        # self.text_encoder = TextEncoderModule(freeze_bert)
+        # ---------- 文字編碼器 ----------
+        # 創建獨立的文字編碼模組，不會被 torch.compile 編譯
+        self.text_encoder = TextEncoderModule(freeze_bert)
 
 
         # ---------- 影像編碼器 ----------
@@ -386,39 +438,33 @@ class MyMultiModel(nn.Module):
             nn.LayerNorm(320)
         )
         
-        # 臨床特徵投影層，將所有embedding concate 後(dim=8*4)投影到與影像瓶頸層(dim=320)相同的通道數
-        self.clinical_expand = nn.Sequential(
-            nn.Linear(8 * 4, 256), # 8是每個嵌入的維度，4是臨床特徵的數量
-            nn.LeakyReLU(inplace=True),
-            nn.Linear(256, 320) # 輸出維度與影像編碼器瓶頸層通道數一致
-        )
+        # # 臨床特徵投影層，將所有embedding concate 後(dim=8*4)投影到與影像瓶頸層(dim=320)相同的通道數
+        # self.clinical_expand = nn.Sequential(
+        #     nn.Linear(8 * 4, 256), # 8是每個嵌入的維度，4是臨床特徵的數量
+        #     nn.LeakyReLU(inplace=True),
+        #     nn.Linear(256, 320) # 輸出維度與影像編碼器瓶頸層通道數一致
+        # )
 
-        # ---------- ASPP 模塊（多層次設計）----------
-        # 在不同層使用不同強度的 ASPP
-        # 深層（低解析度）：使用完整 ASPP 捕獲大範圍上下文
-        # 淺層（高解析度）：不使用 ASPP，保持細節
-        self.aspp_modules = nn.ModuleList([
-            None,  # stage0 (32通道) - 最高解析度，不用 ASPP
-            None,  # stage1 (64通道) - 高解析度，不用 ASPP  
-            None,  # stage2 (128通道) - 中解析度，不用 ASPP
-            ASPP3D(256, 256, rates=[1, 2]),      # stage3 (256通道) - 輕量 ASPP
-            ASPP3D(320, 320, rates=[1, 2, 3]),   # stage4 (320通道) - 中度 ASPP
-            ASPP3D(320, 320, rates=[1, 2, 3, 4]) # stage5 (320通道) - 完整 ASPP (瓶頸層)
-        ])
 
-        # ---------- 門控混合 跳躍連結(skip)與臨床特徵 ----------
+        # ---------- Cross Attention 混合 跳躍連結(skip)與臨床特徵 ----------
         self.multiscale_fusions = nn.ModuleList([
-            GatedFusion(32),
-            GatedFusion(64),
-            GatedFusion(128),
-            # None,
-            # None,
-            # None,
-            GatedFusion(256),
-            GatedFusion(320),
-            GatedFusion(320)
+            CrossAttentionFusion(32,  cli_dim=320, num_heads=4),   # 32 / 4 = 8 (head_dim)
+            CrossAttentionFusion(64,  cli_dim=320, num_heads=8),   # 64 / 8 = 8
+            CrossAttentionFusion(128, cli_dim=320, num_heads=8),   # 128 / 8 = 16
+            CrossAttentionFusion(256, cli_dim=320, num_heads=8),   # 256 / 8 = 32
+            CrossAttentionFusion(320, cli_dim=320, num_heads=8),   # 320 / 8 = 40
+            CrossAttentionFusion(320, cli_dim=320, num_heads=8)    # 320 / 8 = 40
         ])
 
+        # # ---------- 門控混合 跳躍連結(skip)與臨床特徵 ----------
+        # self.multiscale_fusions = nn.ModuleList([
+        #     GatedFusion(32),
+        #     GatedFusion(64),
+        #     GatedFusion(128),
+        #     GatedFusion(256),
+        #     GatedFusion(320),
+        #     GatedFusion(320)
+        # ])
 
         # # ---------- FiLM混合,  Feature-wise Linear Modulation 跳躍連結(skip)與臨床特徵 ----------
         # self.multiscale_fusions = nn.ModuleList([
@@ -564,60 +610,42 @@ class MyMultiModel(nn.Module):
 
 
         x = img
-        for i, stage in enumerate(self.encoder_stages):
+        i=0
+        for stage in self.encoder_stages:
             x = stage(x)
             skips.append(x) # 保存每層下採樣的embedding 用於跳躍連結
-
+            # print(f"Stage: {i}, Input shape: {x.shape}")  # 調試輸出
+            i += 1
         bottleneck = skips[-1]
 
-        # ---------- 臨床 Embedding ----------
-        loc_emb = self.emb_loc(loc) # [B] -> [B, C=8]
-        t_emb   = self.emb_t(t)
-        n_emb   = self.emb_n(n)
-        m_emb   = self.emb_m(m)
-        clinical_vec = torch.cat([loc_emb, t_emb, n_emb, m_emb], dim=1) # [B, C=8] -> [B, 8*4]
-        clinical_feat = self.clinical_expand(clinical_vec) # [B, 8*4] -> [B, 320] (符合瓶頸層維度)
+        # # ---------- 臨床 Embedding ----------
+        # loc_emb = self.emb_loc(loc) # [B] -> [B, C=8]
+        # t_emb   = self.emb_t(t)
+        # n_emb   = self.emb_n(n)
+        # m_emb   = self.emb_m(m)
+        # clinical_vec = torch.cat([loc_emb, t_emb, n_emb, m_emb], dim=1) # [B, C=8] -> [B, 8*4]
+        # clinical_feat = self.clinical_expand(clinical_vec) # [B, 8*4] -> [B, 320] (符合瓶頸層維度)
 
-        # # ---------- 文字 Embedding ----------
-        # # 使用獨立的文字編碼模組，不會被 torch.compile 編譯
-        # text_embeddings = self.text_encoder(text_descriptions) # [B, 768]
-        # text_embeddings = text_embeddings.to(img.device) # 確保與模型在同一設備上
-        # clinical_feat = self.text_expand(text_embeddings) # [B, 768] -> [B, 320] (符合瓶頸層維度)
-
-
-        # # ---------- 融合 ----------
-        # fused_skips = []
-        # for i, skip in enumerate(skips):
-        #     # # skips = [stage0, stage1, stage2, stage3, stage4, stage5]
-        #     # # fused_skips[i] 對應 encoder_stages[i] 的輸出
-
-        #     # # 跳過淺層 計算門控混合的過程
-        #     # # 只對深層(低解析度層)進行融合，淺層直接使用原始跳躍連接
-        #     # if i < 3:  # stage0, stage1, stage2 (高解析度層)
-        #     #     fused_skips.append(None)  # 佔位，保持索引一致
-        #     #     continue
-            
-        #     fused_skip = self.multiscale_fusions[i](skip, clinical_feat)
-        #     fused_skips.append(fused_skip)
+        # ---------- 文字 Embedding ----------
+        # 使用獨立的文字編碼模組，不會被 torch.compile 編譯
+        text_embeddings = self.text_encoder(text_descriptions) # [B, 768]
+        text_embeddings = text_embeddings.to(img.device) # 確保與模型在同一設備上
+        clinical_feat = self.text_expand(text_embeddings) # [B, 768] -> [B, 320] (符合瓶頸層維度)
 
 
-        # ---------- ASPP + 融合 ----------
-        # 關鍵改進：先對影像特徵進行 ASPP 增強，再與臨床特徵融合
-        # 這樣 ASPP 只作用於有空間語義的影像特徵
-        enhanced_skips = []
-        for i, skip in enumerate(skips):
-            # 1. 先對影像特徵進行 ASPP（如果該層有配置）
-            if self.aspp_modules[i] is not None:
-                skip_enhanced = self.aspp_modules[i](skip)
-            else:
-                skip_enhanced = skip  # 淺層不使用 ASPP
-            
-            enhanced_skips.append(skip_enhanced)
-        
-        # 2. 再將增強後的影像特徵與臨床特徵融合
+        # ---------- 融合 ----------
         fused_skips = []
-        for i, enhanced_skip in enumerate(enhanced_skips):
-            fused_skip = self.multiscale_fusions[i](enhanced_skip, clinical_feat)
+        for i, skip in enumerate(skips):
+            # # skips = [stage0, stage1, stage2, stage3, stage4, stage5]
+            # # fused_skips[i] 對應 encoder_stages[i] 的輸出
+
+            # # 跳過淺層 計算門控混合的過程
+            # # 只對深層(低解析度層)進行融合，淺層直接使用原始跳躍連接
+            # if i < 3:  # stage0, stage1, stage2 (高解析度層)
+            #     fused_skips.append(None)  # 佔位，保持索引一致
+            #     continue
+            
+            fused_skip = self.multiscale_fusions[i](skip, clinical_feat)
             fused_skips.append(fused_skip)
 
         # ---------- 解碼器 ----------
