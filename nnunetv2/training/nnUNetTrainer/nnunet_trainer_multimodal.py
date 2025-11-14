@@ -75,7 +75,8 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
         # 這裡需要根據 dataset_name_or_id 判斷是 Dataset100 還是 Dataset101
         # 我們在 run_training_entry 會傳入 dataset_name_or_id
         # 為了簡化，在 Trainer 內部，我們將根據 dataset_json 中的 'name' 來判斷
-        self.is_stage2_dataset = (self.plans_manager.dataset_name == "Dataset101")
+        # self.is_stage2_dataset = (self.plans_manager.dataset_name == "Dataset101")
+        self.is_stage2_dataset = True
         
         self.clinical_data_dir = None
         if self.is_stage2_dataset:
@@ -351,7 +352,16 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
             
             # 統計臨床資料的類別數量 同時計算focal loss的權重
             clinical_df = dataset_tr.clinical_df
-            clinical_df_tr = clinical_df.loc[tr_keys]
+            
+            # 標準化 tr_keys 以便查詢 (因為 clinical_df 的 index 已經標準化)
+            normalized_tr_keys = [
+                dataset_tr.clinical_data_label_encoder.normalize_case_index(key) 
+                for key in tr_keys
+            ]
+            # 只保留存在於 clinical_df 中的 keys
+            valid_tr_keys = [key for key in normalized_tr_keys if key in clinical_df.index]
+            
+            clinical_df_tr = clinical_df.loc[valid_tr_keys]
             clinical_valid_class_counts = {}
             clinical_class_weights = {}
             # 定義每個欄位的 missing flag（通常是最大類別編號）
@@ -410,10 +420,27 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
                 print(f"M_stage 權重張量: {self.m_weight}")
 
             # 設置交叉熵損失 (CE Loss)
-            self.ce_loss_loc = nn.CrossEntropyLoss(weight=self.loc_weight, reduction='mean')
-            self.ce_loss_t = nn.CrossEntropyLoss(weight=self.t_weight, reduction='mean')
-            self.ce_loss_n = nn.CrossEntropyLoss(weight=self.n_weight, reduction='mean')
-            self.ce_loss_m = nn.CrossEntropyLoss(weight=self.m_weight, reduction='mean')
+            # 使用 ignore_index 忽略 missing flag 的樣本
+            self.ce_loss_loc = nn.CrossEntropyLoss(
+                weight=self.loc_weight, 
+                reduction='mean',
+                ignore_index=dataset_tr.clinical_data_label_encoder.missing_flag_location
+            )
+            self.ce_loss_t = nn.CrossEntropyLoss(
+                weight=self.t_weight, 
+                reduction='mean',
+                ignore_index=dataset_tr.clinical_data_label_encoder.missing_flag_t_stage
+            )
+            self.ce_loss_n = nn.CrossEntropyLoss(
+                weight=self.n_weight, 
+                reduction='mean',
+                ignore_index=dataset_tr.clinical_data_label_encoder.missing_flag_n_stage
+            )
+            self.ce_loss_m = nn.CrossEntropyLoss(
+                weight=self.m_weight, 
+                reduction='mean',
+                ignore_index=dataset_tr.clinical_data_label_encoder.missing_flag_m_stage
+            )
 
 
             # 將 focal loss 套用深度監督包裝器 (直接計算所有解析度輸出的loss)

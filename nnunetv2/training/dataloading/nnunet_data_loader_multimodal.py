@@ -88,21 +88,21 @@ class nnUNetDataLoaderMultimodal(nnUNetDataLoader):
         if clinical_mask_dict['t_stage']:
             t_idx = clinical_data_dict['t_stage']
             t_stage_name = t_stage_mapping[t_idx]
-            if t_stage_name != 'Missing':
+            if t_stage_name != 'T0' or t_stage_name != 'Missing':
                 feature_descriptions.append(f"with T stage {t_stage_name}")
         
         # N Stage 描述
         if clinical_mask_dict['n_stage']:
             n_idx = clinical_data_dict['n_stage']
             n_stage_name = n_stage_mapping[n_idx]
-            if n_stage_name != 'Missing':
+            if n_stage_name != 'N0' or n_stage_name != 'Missing':
                 feature_descriptions.append(f"N stage {n_stage_name}")
         
         # M Stage 描述
         if clinical_mask_dict['m_stage']:
             m_idx = clinical_data_dict['m_stage']
             m_stage_name = m_stage_mapping[m_idx]
-            if m_stage_name != 'Missing':
+            if  m_stage_name != 'M0' or m_stage_name != 'Missing':
                 metastasis_desc = "with distant metastasis" if m_stage_name == "M1" else "without distant metastasis"
                 feature_descriptions.append(metastasis_desc)
         

@@ -99,6 +99,10 @@ class ClinicalDataLabelEncoder:
             # 如果沒有 Case_Index 但有 ID 列，則使用 ID 作為 Case_Index
             self.clinical_encoded_df['Case_Index'] = self.clinical_encoded_df['ID']
             print("使用 ID 列作為 Case_Index")
+        
+        # 標準化 Case_Index 格式：同時支援 3 位數和 4 位數
+        # 建立標準化映射表：colon_001 -> colon_0001, colon_0001 -> colon_0001
+        self._build_case_index_mapping()
             
         # 如果有 location/t_stage/n_stage/m_stage 列但沒有小寫的對應列，則添加小寫列
         if 'Location' in self.clinical_encoded_df.columns and 'location' not in self.clinical_encoded_df.columns:
@@ -111,6 +115,62 @@ class ClinicalDataLabelEncoder:
             self.clinical_encoded_df['m_stage'] = self.clinical_encoded_df['M_stage']
             
         print(f"已載入臨床數據，可用欄位: {self.clinical_encoded_df.columns.tolist()}")
+    
+    def _build_case_index_mapping(self):
+        """
+        建立 Case_Index 的標準化映射表，同時支援 3 位數和 4 位數格式
+        例如: colon_001 和 colon_0001 都對應到相同的資料
+        """
+        import re
+        self.case_index_map = {}
+        
+        for idx in self.clinical_encoded_df['Case_Index']:
+            # 提取前綴和數字部分
+            match = re.match(r'([a-zA-Z_]+)(\d+)', str(idx))
+            if match:
+                prefix = match.group(1)  # 例如 'colon_'
+                number = match.group(2)  # 例如 '001' 或 '0001'
+                
+                # 標準化為 4 位數格式
+                standardized = f"{prefix}{int(number):04d}"
+                
+                # 建立雙向映射：原始格式 -> 標準化格式
+                self.case_index_map[idx] = standardized
+                # 同時建立標準化格式的映射（指向自己）
+                self.case_index_map[standardized] = standardized
+                
+                # 也建立 3 位數格式的映射
+                three_digit = f"{prefix}{int(number):03d}"
+                self.case_index_map[three_digit] = standardized
+            else:
+                # 如果無法解析，直接使用原始值
+                self.case_index_map[idx] = idx
+        
+        print(f"建立了 {len(set(self.case_index_map.values()))} 個唯一案例的標準化映射")
+    
+    def normalize_case_index(self, case_id: str) -> str:
+        """
+        標準化 Case_Index，支援 3 位數和 4 位數格式
+        
+        Args:
+            case_id: 原始的 case identifier (例如 'colon_001' 或 'colon_0001')
+        
+        Returns:
+            標準化後的 case identifier (統一為 4 位數格式)
+        """
+        if case_id in self.case_index_map:
+            return self.case_index_map[case_id]
+        
+        # 如果映射表中沒有，嘗試動態解析
+        import re
+        match = re.match(r'([a-zA-Z_]+)(\d+)', str(case_id))
+        if match:
+            prefix = match.group(1)
+            number = match.group(2)
+            return f"{prefix}{int(number):04d}"
+        
+        # 無法解析時返回原始值
+        return case_id
 
     # 進行標籤編碼
     def forward(self) -> pd.DataFrame:

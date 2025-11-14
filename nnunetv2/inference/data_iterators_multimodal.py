@@ -85,6 +85,13 @@ def preprocess_fromfiles_save_to_queue_multimodal(list_of_lists: List[List[str]]
                 # 讀取原始 CSV 檔案
                 # 進行預處理 (label encoding)
                 clinical_full_df = clinical_data_label_encoder.forward()  # 讀取並編碼臨床資料
+                
+                # 標準化所有 Case_Index (統一為 4 位數格式)
+                clinical_full_df['Case_Index_Original'] = clinical_full_df['Case_Index']
+                clinical_full_df['Case_Index'] = clinical_full_df['Case_Index'].apply(
+                    clinical_data_label_encoder.normalize_case_index
+                )
+                
                 # 如果有 Case_Index 欄位，則設為索引
                 if 'Case_Index' in clinical_full_df.columns:
                     clinical_full_df = clinical_full_df.set_index('Case_Index', drop=False)
@@ -95,7 +102,7 @@ def preprocess_fromfiles_save_to_queue_multimodal(list_of_lists: List[List[str]]
                 if len(unique_cases) > 0:
                     sample_cases = unique_cases[:5] if len(unique_cases) >= 5 else unique_cases
                 
-                print(f"臨床數據編碼器初始化成功")
+                print(f"臨床數據編碼器初始化成功，已標準化 {len(unique_cases)} 個案例ID")
 
                 # print(f"clinical_full_df: {clinical_full_df}")                
 
@@ -161,9 +168,15 @@ def preprocess_fromfiles_save_to_queue_multimodal(list_of_lists: List[List[str]]
 
             if case_id and clinical_data_label_encoder:
                 try:
-
+                    # 標準化 case_id (支援 3 位數和 4 位數格式)
+                    normalized_case_id = clinical_data_label_encoder.normalize_case_index(case_id)
+                    
                     # 抓出該案例的所有特徵
-                    row = clinical_full_df[clinical_full_df['Case_Index'] == case_id]
+                    row = clinical_full_df[clinical_full_df['Case_Index'] == normalized_case_id]
+                    
+                    # 如果標準化後找不到，嘗試使用原始 case_id
+                    if row.empty:
+                        row = clinical_full_df[clinical_full_df['Case_Index'] == case_id]
 
                     # 檢查是否找到了案例資料
                     if not row.empty:
@@ -179,7 +192,8 @@ def preprocess_fromfiles_save_to_queue_multimodal(list_of_lists: List[List[str]]
                         clinical_mask['m_stage'] = clinical_data['m_stage'] != missing_flags.get('m_stage', -1)
                     else:
                         # 找不到案例時，輸出警告並保持默認值（全部設為缺失）
-                        print(f"警告: 在臨床數據中找不到案例 {case_id}，使用缺失值")
+                        if verbose:
+                            print(f"警告: 在臨床數據中找不到案例 {case_id} (標準化為 {normalized_case_id})，使用缺失值")
                 
                 except Exception as e:
                     if verbose:

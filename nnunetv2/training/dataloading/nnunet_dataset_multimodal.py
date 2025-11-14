@@ -35,12 +35,27 @@ class nnUNetDatasetMultimodal(nnUNetDatasetBlosc2):
         self.clinical_data_label_encoder = ClinicalDataLabelEncoder(self.clinical_data_dir)  # 初始化標籤編碼器
         # 進行預處理 (label encoding)
         self.clinical_full_df = self.clinical_data_label_encoder.forward()  # 讀取並編碼臨床資料
+        
+        # 標準化所有 Case_Index (統一為 4 位數格式)
+        self.clinical_full_df['Case_Index_Original'] = self.clinical_full_df['Case_Index']  # 保留原始值
+        self.clinical_full_df['Case_Index'] = self.clinical_full_df['Case_Index'].apply(
+            self.clinical_data_label_encoder.normalize_case_index
+        )
+        
         # 如果有 Case_Index 欄位，則設為索引
         if 'Case_Index' in self.clinical_full_df.columns:
             self.clinical_full_df = self.clinical_full_df.set_index('Case_Index', drop=False)
+        
         # 過濾只保留 identifiers 對應的 row
         if identifiers is not None:
-            self.clinical_df = self.clinical_full_df.loc[identifiers]
+            # 標準化 identifiers
+            normalized_identifiers = [self.clinical_data_label_encoder.normalize_case_index(id) for id in identifiers]
+            # 使用標準化後的 identifiers 進行過濾
+            available_ids = [id for id in normalized_identifiers if id in self.clinical_full_df.index]
+            if len(available_ids) < len(normalized_identifiers):
+                missing_ids = set(normalized_identifiers) - set(available_ids)
+                print(f"警告: {len(missing_ids)} 個案例在臨床數據中找不到: {list(missing_ids)[:5]}...")
+            self.clinical_df = self.clinical_full_df.loc[available_ids]
         else:
             self.clinical_df = self.clinical_full_df
 
@@ -83,9 +98,15 @@ class nnUNetDatasetMultimodal(nnUNetDatasetBlosc2):
                 return data, seg, seg_prev, properties
 
         # 開始處理臨床影像
-        row = self.clinical_df[self.clinical_df['Case_Index'] == identifier]
+        # 標準化 identifier (支援 3 位數和 4 位數格式)
+        normalized_id = self.clinical_data_label_encoder.normalize_case_index(identifier)
+        row = self.clinical_df[self.clinical_df['Case_Index'] == normalized_id]
+        
         if row.empty:
-            raise KeyError(f"找不到 Case_Index={identifier} 的臨床資料")
+            # 如果標準化後還是找不到，嘗試直接查詢原始 identifier
+            row = self.clinical_df[self.clinical_df['Case_Index'] == identifier]
+            if row.empty:
+                raise KeyError(f"找不到 Case_Index={identifier} (標準化為 {normalized_id}) 的臨床資料")
 
         # 轉成索引 (原始CSV檔才有大寫開頭 後續程式全部小寫!)
         loc_idx = row['Location'].values[0]
