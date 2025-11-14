@@ -179,6 +179,139 @@ class CrossAttentionFusion(nn.Module):
         return out
 
 
+class CrossAttentionFusion_Reverse(nn.Module):
+    """
+    反向 Cross Attention: 使用臨床特徵查詢影像特徵
+    適用於影像分割任務：
+    - 臨床特徵作為 Query（詢問：影像中哪些區域與臨床資訊相關？）
+    - 影像特徵作為 Key/Value（提供：這些是影像的空間資訊）
+    
+    目標：利用臨床資料來指導模型關注影像中的相關區域,提升分割精度
+    """
+    def __init__(self, channels: int, cli_dim: int = 320, num_heads: int = 8, dropout: float = 0.1):
+        super().__init__()
+        self.channels = channels
+        self.num_heads = num_heads
+        self.head_dim = channels // num_heads
+        
+        assert channels % num_heads == 0, f"channels ({channels}) 必須能被 num_heads ({num_heads}) 整除"
+        
+        # 臨床特徵投影 (作為 Query)
+        # 將臨床特徵擴展為多個 query token
+        self.num_query_tokens = 4  # 臨床資訊分解為4個query
+        self.cli_query = nn.Sequential(
+            nn.Linear(cli_dim, channels * self.num_query_tokens),
+            nn.LayerNorm(channels * self.num_query_tokens)
+        )
+        
+        # 影像特徵投影 (作為 Key 和 Value)
+        self.img_key = nn.Conv3d(channels, channels, 1)
+        self.img_value = nn.Conv3d(channels, channels, 1)
+        
+        # 輸出投影 - 將注意力結果投影回影像空間
+        self.out_proj = nn.Sequential(
+            nn.Linear(channels * self.num_query_tokens, channels),
+            nn.LayerNorm(channels)
+        )
+        
+        # Dropout
+        self.attn_dropout = nn.Dropout(dropout)
+        self.proj_dropout = nn.Dropout(dropout)
+        
+        # 後處理：融合原始影像特徵與注意力結果
+        self.fusion_conv = nn.Sequential(
+            nn.Conv3d(channels * 2, channels, 3, padding=1),
+            InstanceNorm3d(channels),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Conv3d(channels, channels, 3, padding=1),
+            InstanceNorm3d(channels)
+        )
+        
+        # 縮放因子
+        self.scale = self.head_dim ** -0.5
+        
+        self.apply(self._init_weights)
+    
+    def _init_weights(self, m):
+        """初始化權重"""
+        if isinstance(m, (nn.Conv3d, nn.Linear)):
+            nn.init.kaiming_normal_(m.weight, nonlinearity='leaky_relu', a=0.01)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, (InstanceNorm3d, nn.LayerNorm)):
+            if m.weight is not None:
+                nn.init.constant_(m.weight, 1)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+    
+    def forward(self, img_feat, cli_feat):
+        """
+        img_feat : [B, C, D, H, W]  影像空間特徵
+        cli_feat : [B, cli_dim]     臨床全局特徵
+        
+        反向策略：
+        1. 臨床特徵擴展為多個 Query tokens
+        2. 影像每個空間位置作為 Key/Value
+        3. 每個臨床 query 自適應地從影像空間中提取相關資訊
+        4. 將提取的資訊廣播回影像空間
+        """
+        B, C, D, H, W = img_feat.shape
+        spatial_size = D * H * W
+        
+        # 1. 臨床特徵投影為多個 Query tokens
+        query_raw = self.cli_query(cli_feat)  # [B, C * num_query_tokens]
+        # 重塑為 multi-head 格式
+        # [B, C * num_query_tokens] -> [B, num_heads, head_dim, num_query_tokens]
+        query = query_raw.view(B, self.num_heads, self.head_dim, self.num_query_tokens)
+        
+        # 2. 影像特徵投影為 Key 和 Value (每個空間位置)
+        key = self.img_key(img_feat)    # [B, C, D, H, W]
+        value = self.img_value(img_feat)  # [B, C, D, H, W]
+        
+        # 重塑為 multi-head 格式
+        # [B, C, D, H, W] -> [B, num_heads, head_dim, D*H*W]
+        key = key.view(B, self.num_heads, self.head_dim, spatial_size)
+        value = value.view(B, self.num_heads, self.head_dim, spatial_size)
+        
+        # 3. 計算 Attention scores
+        # query:  [B, num_heads, head_dim, num_query_tokens]
+        # key:    [B, num_heads, head_dim, D*H*W]
+        # scores: [B, num_heads, num_query_tokens, D*H*W]
+        attn_scores = torch.matmul(query.transpose(-2, -1), key) * self.scale
+        
+        # 在影像空間位置維度上做 softmax
+        # 每個臨床 query 決定關注影像中的哪些位置
+        attn_weights = torch.softmax(attn_scores, dim=-1)  # [B, num_heads, num_query_tokens, D*H*W]
+        attn_weights = self.attn_dropout(attn_weights)
+        
+        # 4. 應用 Attention 到 Value
+        # attn_weights: [B, num_heads, num_query_tokens, D*H*W]
+        # value:        [B, num_heads, head_dim, D*H*W]
+        # attn_output:  [B, num_heads, head_dim, num_query_tokens]
+        attn_output = torch.matmul(value, attn_weights.transpose(-2, -1))
+        
+        # 5. 合併多頭輸出
+        # [B, num_heads, head_dim, num_query_tokens] -> [B, C * num_query_tokens]
+        attn_output = attn_output.contiguous().view(B, -1)
+        
+        # 6. 投影回通道維度並廣播到空間維度
+        attn_output = self.out_proj(attn_output)  # [B, C]
+        attn_output = self.proj_dropout(attn_output)
+        
+        # 廣播到空間維度 [B, C] -> [B, C, D, H, W]
+        attn_output = attn_output.view(B, C, 1, 1, 1).expand(-1, -1, D, H, W)
+        
+        # 7. 融合原始影像特徵與注意力增強特徵
+        fused = torch.cat([img_feat, attn_output], dim=1)  # [B, 2C, D, H, W]
+        out = self.fusion_conv(fused)  # [B, C, D, H, W]
+        
+        # 8. 殘差連接
+        out = out + img_feat
+        
+        return out
+
+
 class FiLMAddFusion(nn.Module):
     """
     用 FiLM 把臨床向量變成 γ、β,對影像 feature 做逐通道仿射變換。
@@ -447,13 +580,24 @@ class MyMultiModel(nn.Module):
 
 
         # ---------- Cross Attention 混合 跳躍連結(skip)與臨床特徵 ----------
+        # 原版: 影像 Query 臨床 Key/Value (空間適應性)
+        # self.multiscale_fusions = nn.ModuleList([
+        #     CrossAttentionFusion(32,  cli_dim=320, num_heads=4),   # 32 / 4 = 8 (head_dim)
+        #     CrossAttentionFusion(64,  cli_dim=320, num_heads=8),   # 64 / 8 = 8
+        #     CrossAttentionFusion(128, cli_dim=320, num_heads=8),   # 128 / 8 = 16
+        #     CrossAttentionFusion(256, cli_dim=320, num_heads=8),   # 256 / 8 = 32
+        #     CrossAttentionFusion(320, cli_dim=320, num_heads=8),   # 320 / 8 = 40
+        #     CrossAttentionFusion(320, cli_dim=320, num_heads=8)    # 320 / 8 = 40
+        # ])
+
+        # 反向版: 臨床 Query 影像 Key/Value (臨床指導)
         self.multiscale_fusions = nn.ModuleList([
-            CrossAttentionFusion(32,  cli_dim=320, num_heads=4),   # 32 / 4 = 8 (head_dim)
-            CrossAttentionFusion(64,  cli_dim=320, num_heads=8),   # 64 / 8 = 8
-            CrossAttentionFusion(128, cli_dim=320, num_heads=8),   # 128 / 8 = 16
-            CrossAttentionFusion(256, cli_dim=320, num_heads=8),   # 256 / 8 = 32
-            CrossAttentionFusion(320, cli_dim=320, num_heads=8),   # 320 / 8 = 40
-            CrossAttentionFusion(320, cli_dim=320, num_heads=8)    # 320 / 8 = 40
+            CrossAttentionFusion_Reverse(32,  cli_dim=320, num_heads=4),   # 32 / 4 = 8 (head_dim)
+            CrossAttentionFusion_Reverse(64,  cli_dim=320, num_heads=8),   # 64 / 8 = 8
+            CrossAttentionFusion_Reverse(128, cli_dim=320, num_heads=8),   # 128 / 8 = 16
+            CrossAttentionFusion_Reverse(256, cli_dim=320, num_heads=8),   # 256 / 8 = 32
+            CrossAttentionFusion_Reverse(320, cli_dim=320, num_heads=8),   # 320 / 8 = 40
+            CrossAttentionFusion_Reverse(320, cli_dim=320, num_heads=8)    # 320 / 8 = 40
         ])
 
         # # ---------- 門控混合 跳躍連結(skip)與臨床特徵 ----------
