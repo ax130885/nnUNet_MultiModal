@@ -65,7 +65,8 @@ class nnUNetDatasetMultimodal(nnUNetDatasetBlosc2):
             'location': self.clinical_data_label_encoder.num_location_classes,
             't_stage':  self.clinical_data_label_encoder.num_t_stage_classes,
             'n_stage':  self.clinical_data_label_encoder.num_n_stage_classes,
-            'm_stage':  self.clinical_data_label_encoder.num_m_stage_classes
+            'm_stage':  self.clinical_data_label_encoder.num_m_stage_classes,
+            'dataset': self.clinical_data_label_encoder.num_dataset_classes
         }
 
         # 每個特徵的缺失標記 = 類別數量 - 1
@@ -73,7 +74,8 @@ class nnUNetDatasetMultimodal(nnUNetDatasetBlosc2):
             'location': self.clinical_data_label_encoder.missing_flag_location,
             't_stage':  self.clinical_data_label_encoder.missing_flag_t_stage,
             'n_stage':  self.clinical_data_label_encoder.missing_flag_n_stage,
-            'm_stage':  self.clinical_data_label_encoder.missing_flag_m_stage
+            'm_stage':  self.clinical_data_label_encoder.missing_flag_m_stage,
+            'dataset': self.clinical_data_label_encoder.missing_flag_dataset
         }
 
 
@@ -113,12 +115,14 @@ class nnUNetDatasetMultimodal(nnUNetDatasetBlosc2):
         t_idx   = row['T_stage'].values[0]
         n_idx   = row['N_stage'].values[0]
         m_idx   = row['M_stage'].values[0]
+        dataset_idx = row['Dataset'].values[0]
 
         clinical_data_dict = {
             'location': loc_idx, # [1] 純量元素
             't_stage':  t_idx,
             'n_stage':  n_idx,
-            'm_stage':  m_idx
+            'm_stage':  m_idx,
+            'dataset': dataset_idx
         }
 
         # 4. 製作 mask（True = 有臨床資料）
@@ -126,7 +130,8 @@ class nnUNetDatasetMultimodal(nnUNetDatasetBlosc2):
             'location': loc_idx != self.missing_flags['location'],
             't_stage':  t_idx   != self.missing_flags['t_stage'],
             'n_stage':  n_idx   != self.missing_flags['n_stage'],
-            'm_stage':  m_idx   != self.missing_flags['m_stage']
+            'm_stage':  m_idx   != self.missing_flags['m_stage'],
+            'dataset': dataset_idx != self.missing_flags['dataset']
         }
 
         return data, seg, seg_prev, properties, clinical_data_dict, clinical_mask_bool
@@ -165,8 +170,8 @@ def infer_dataset_class_multimodal(folder: str, clinical_data_dir: str = None) -
 if __name__ == "__main__":
     # 測試 nnUNetDatasetMultimodal 是否能正確加載資料
     dataset = nnUNetDatasetMultimodal(
-        folder='/mnt/data1/graduate/yuxin/Lab/model/UNet_base/nnunet_ins_data/data_test/nnUNet_preprocessed/Dataset101/nnUNetPlans_3d_fullres',
-        clinical_data_dir='/mnt/data1/graduate/yuxin/Lab/model/UNet_base/nnunet_ins_data/data_test/nnUNet_raw/Dataset101'
+        folder='/mnt/data1/graduate/yuxin/Lab/model/UNet_base/nnunet_ins_data/data_test/nnUNet_preprocessed/Dataset201_mix/nnUNetPlans_3d_fullres',
+        clinical_data_dir='/mnt/data1/graduate/yuxin/Lab/model/UNet_base/nnunet_ins_data/data_test/nnUNet_raw/Dataset201_mix'
     )
     data, seg, seg_prev, properties, clinical_data_dict, clinical_mask_bool = dataset.load_case("colon_001")
 

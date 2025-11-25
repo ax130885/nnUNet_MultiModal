@@ -88,23 +88,30 @@ class nnUNetDataLoaderMultimodal(nnUNetDataLoader):
         if clinical_mask_dict['t_stage']:
             t_idx = clinical_data_dict['t_stage']
             t_stage_name = t_stage_mapping[t_idx]
-            if t_stage_name != 'T0' or t_stage_name != 'Missing':
+            if t_stage_name != 'T0' and t_stage_name != 'Missing':
                 feature_descriptions.append(f"with T stage {t_stage_name}")
         
         # N Stage 描述
         if clinical_mask_dict['n_stage']:
             n_idx = clinical_data_dict['n_stage']
             n_stage_name = n_stage_mapping[n_idx]
-            if n_stage_name != 'N0' or n_stage_name != 'Missing':
+            if n_stage_name != 'N0' and n_stage_name != 'Missing':
                 feature_descriptions.append(f"N stage {n_stage_name}")
         
         # M Stage 描述
         if clinical_mask_dict['m_stage']:
             m_idx = clinical_data_dict['m_stage']
             m_stage_name = m_stage_mapping[m_idx]
-            if  m_stage_name != 'M0' or m_stage_name != 'Missing':
+            if m_stage_name != 'M0' and m_stage_name != 'Missing':
                 metastasis_desc = "with distant metastasis" if m_stage_name == "M1" else "without distant metastasis"
                 feature_descriptions.append(metastasis_desc)
+
+        # Dataset 描述
+        if clinical_mask_dict['dataset']:
+            dataset_idx = clinical_data_dict['dataset']
+            dataset_name = self.clinical_data_label_encoder.reverse_dataset_mapping[dataset_idx]
+            if dataset_name != 'Missing':
+                feature_descriptions.append(f"from the {dataset_name} dataset")
         
         # 組合描述
         if feature_descriptions:
@@ -127,9 +134,9 @@ class nnUNetDataLoaderMultimodal(nnUNetDataLoader):
         seg_all = np.zeros(self.seg_shape, dtype=np.int16)
 
         # 初始化臨床資料（原始 label）
-        clinical_data_label = {'location': [], 't_stage': [], 'n_stage': [], 'm_stage': []}
+        clinical_data_label = {'location': [], 't_stage': [], 'n_stage': [], 'm_stage': [], 'dataset': []}
         # 初始化臨床資料 mask（是否有 label）
-        clinical_mask = {'location': [], 't_stage': [], 'n_stage': [], 'm_stage': []}
+        clinical_mask = {'location': [], 't_stage': [], 'n_stage': [], 'm_stage': [], 'dataset': []}
 
         # j: 第幾次迴圈
         # i: 當前選中的病例識別符 (索引)
@@ -152,7 +159,7 @@ class nnUNetDataLoaderMultimodal(nnUNetDataLoader):
             seg_all[j] = seg_cropped
             
             # 儲存原始臨床資料作為 label（強制轉為 Python int）
-            for k in ['location', 't_stage', 'n_stage', 'm_stage']:
+            for k in ['location', 't_stage', 'n_stage', 'm_stage', 'dataset']:
                 clinical_data_label[k].append(int(clinical_data_dict[k]))
                 clinical_mask[k].append(bool(clinical_mask_bool[k]))
 
@@ -248,12 +255,12 @@ class nnUNetDataLoaderMultimodal(nnUNetDataLoader):
 if __name__ == "__main__":
     # 測試 nnUNetDataLoaderMultimodal 是否能正確生成批次數據
     dataset = nnUNetDatasetMultimodal(
-        folder='/mnt/data1/graduate/yuxin/Lab/model/UNet_base/nnunet_ins_data/data_test/nnUNet_preprocessed/Dataset101/nnUNetPlans_3d_fullres',
-        clinical_data_dir='/mnt/data1/graduate/yuxin/Lab/model/UNet_base/nnunet_ins_data/data_test/nnUNet_raw/Dataset101'
+        folder='/mnt/data1/graduate/yuxin/Lab/model/UNet_base/nnunet_ins_data/data_test/nnUNet_preprocessed/Dataset201_mix/nnUNetPlans_3d_fullres',
+        clinical_data_dir='/mnt/data1/graduate/yuxin/Lab/model/UNet_base/nnunet_ins_data/data_test/nnUNet_raw/Dataset201_mix'
     )
     from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
-    plans_manager = PlansManager("/mnt/data1/graduate/yuxin/Lab/model/UNet_base/nnunet_ins_data/data_test/nnUNet_preprocessed/Dataset101/nnUNetPlans.json")
-    dataset_json = load_json("/mnt/data1/graduate/yuxin/Lab/model/UNet_base/nnunet_ins_data/data_test/nnUNet_preprocessed/Dataset101/dataset.json")
+    plans_manager = PlansManager("/mnt/data1/graduate/yuxin/Lab/model/UNet_base/nnunet_ins_data/data_test/nnUNet_preprocessed/Dataset201_mix/nnUNetPlans.json")
+    dataset_json = load_json("/mnt/data1/graduate/yuxin/Lab/model/UNet_base/nnunet_ins_data/data_test/nnUNet_preprocessed/Dataset201_mix/dataset.json")
     label_manager = plans_manager.get_label_manager(dataset_json)
 
     data_loader = nnUNetDataLoaderMultimodal(

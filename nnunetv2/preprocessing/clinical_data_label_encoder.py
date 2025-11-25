@@ -49,24 +49,32 @@ class ClinicalDataLabelEncoder:
             'M1': 1,
             'Missing': 2
         }
+        self.dataset_mapping = {
+            'Medical Segmentation Decathlon': 0,
+            'National Taiwan University Hospital': 1,
+            'Missing': 2
+        }
 
         # 計算類別數量
         self.num_location_classes = len(self.location_mapping)
         self.num_t_stage_classes = len(self.t_stage_mapping)
         self.num_n_stage_classes = len(self.n_stage_mapping)
         self.num_m_stage_classes = len(self.m_stage_mapping)
+        self.num_dataset_classes = len(self.dataset_mapping)
 
         # 設定缺失標記的索引 = 類別數量 - 1
         self.missing_flag_location = self.num_location_classes - 1
         self.missing_flag_t_stage = self.num_t_stage_classes - 1
         self.missing_flag_n_stage = self.num_n_stage_classes - 1
         self.missing_flag_m_stage = self.num_m_stage_classes - 1
+        self.missing_flag_dataset = self.num_dataset_classes - 1
 
         # 建立反向映射表
         self.reverse_location_mapping = {v: k for k, v in self.location_mapping.items()}
         self.reverse_t_stage_mapping = {v: k for k, v in self.t_stage_mapping.items()}
         self.reverse_n_stage_mapping = {v: k for k, v in self.n_stage_mapping.items()}
         self.reverse_m_stage_mapping = {v: k for k, v in self.m_stage_mapping.items()}
+        self.reverse_dataset_mapping = {v: k for k, v in self.dataset_mapping.items()}
         
         # 檢查編碼後的CSV文件是否存在，如果不存在則創建
         if not isfile(self.output_csv_path):
@@ -113,6 +121,8 @@ class ClinicalDataLabelEncoder:
             self.clinical_encoded_df['n_stage'] = self.clinical_encoded_df['N_stage']
         if 'M_stage' in self.clinical_encoded_df.columns and 'm_stage' not in self.clinical_encoded_df.columns:
             self.clinical_encoded_df['m_stage'] = self.clinical_encoded_df['M_stage']
+        if 'Dataset' in self.clinical_encoded_df.columns and 'dataset' not in self.clinical_encoded_df.columns:
+            self.clinical_encoded_df['dataset'] = self.clinical_encoded_df['Dataset']
             
         print(f"已載入臨床數據，可用欄位: {self.clinical_encoded_df.columns.tolist()}")
     
@@ -184,13 +194,16 @@ class ClinicalDataLabelEncoder:
         df['T_stage'] = df['T_stage'].astype(str).str.strip().replace('', 'Missing')
         df['N_stage'] = df['N_stage'].astype(str).str.strip().replace('', 'Missing')
         df['M_stage'] = df['M_stage'].astype(str).str.strip().replace('', 'Missing')
+        df['Dataset'] = df['Dataset'].astype(str).str.strip().replace('', 'Missing')
+
 
         # 檢查是否有值不在映射表 key 中，若有則報錯
         for col, mapping, name in [
             ('Location', self.location_mapping, 'Location'),
             ('T_stage', self.t_stage_mapping, 'T_stage'),
             ('N_stage', self.n_stage_mapping, 'N_stage'),
-            ('M_stage', self.m_stage_mapping, 'M_stage')
+            ('M_stage', self.m_stage_mapping, 'M_stage'),
+            ('Dataset', self.dataset_mapping, 'Dataset')
         ]:
             unknown_values = set(df[col].astype(str).str.strip().replace('', 'Missing')) - set(mapping.keys())
             if unknown_values:
@@ -201,12 +214,14 @@ class ClinicalDataLabelEncoder:
         df['t_stage'] = df['T_stage'].map(self.t_stage_mapping)
         df['n_stage'] = df['N_stage'].map(self.n_stage_mapping)
         df['m_stage'] = df['M_stage'].map(self.m_stage_mapping)
+        df['dataset'] = df['Dataset'].map(self.dataset_mapping)
         
         # 保留原始大寫列
         df['Location'] = df['Location'].map(self.location_mapping)
         df['T_stage'] = df['T_stage'].map(self.t_stage_mapping)
         df['N_stage'] = df['N_stage'].map(self.n_stage_mapping)
         df['M_stage'] = df['M_stage'].map(self.m_stage_mapping)
+        df['Dataset'] = df['Dataset'].map(self.dataset_mapping)
 
         # 確保有 Case_Index 列
         if 'Case_Index' not in df.columns and 'ID' in df.columns:
@@ -224,6 +239,7 @@ class ClinicalDataLabelEncoder:
         df['T_stage'] = df['T_stage'].map(self.reverse_t_stage_mapping)
         df['N_stage'] = df['N_stage'].map(self.reverse_n_stage_mapping)
         df['M_stage'] = df['M_stage'].map(self.reverse_m_stage_mapping)
+        df['Dataset'] = df['Dataset'].map(self.reverse_dataset_mapping)
         return df
 
 
@@ -258,6 +274,6 @@ def main(csv_dir: str = None):
 
 
 if __name__ == '__main__':
-    csv_dir = '/home/admin/yuxin/data/Lab/model/UNet_base/nnunet_ins_data/data_test/nnUNet_raw/Dataset101'
+    csv_dir = '/home/admin/yuxin/data/Lab/model/UNet_base/nnunet_ins_data/data_test/nnUNet_raw/Dataset201_mix'
     main(csv_dir)
     # main()

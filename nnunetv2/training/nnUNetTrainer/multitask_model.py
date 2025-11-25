@@ -493,12 +493,16 @@ class MyMultiModel(nn.Module):
         self.num_t_stage_classes = encoder.num_t_stage_classes # 6
         self.num_n_stage_classes = encoder.num_n_stage_classes # 4
         self.num_m_stage_classes = encoder.num_m_stage_classes # 3
+        self.num_dataset_classes = encoder.num_dataset_classes # 2
 
         # 讀取臨床資料的缺失idx
         self.missing_flag_location = encoder.missing_flag_location # 7
         self.missing_flag_t_stage = encoder.missing_flag_t_stage # 5
         self.missing_flag_n_stage = encoder.missing_flag_n_stage # 3
         self.missing_flag_m_stage = encoder.missing_flag_m_stage # 2
+        self.missing_flag_dataset = encoder.missing_flag_dataset # 1
+
+
 
 
 
@@ -571,9 +575,9 @@ class MyMultiModel(nn.Module):
             nn.LayerNorm(320)
         )
         
-        # # 臨床特徵投影層，將所有embedding concate 後(dim=8*4)投影到與影像瓶頸層(dim=320)相同的通道數
+        # # 臨床特徵投影層，將所有embedding concate 後(dim=8*5)投影到與影像瓶頸層(dim=320)相同的通道數
         # self.clinical_expand = nn.Sequential(
-        #     nn.Linear(8 * 4, 256), # 8是每個嵌入的維度，4是臨床特徵的數量
+        #     nn.Linear(8 * 5, 256), # 8是每個嵌入的維度，5是臨床特徵的數量
         #     nn.LeakyReLU(inplace=True),
         #     nn.Linear(256, 320) # 輸出維度與影像編碼器瓶頸層通道數一致
         # )
@@ -581,24 +585,24 @@ class MyMultiModel(nn.Module):
 
         # ---------- Cross Attention 混合 跳躍連結(skip)與臨床特徵 ----------
         # 原版: 影像 Query 臨床 Key/Value (空間適應性)
-        # self.multiscale_fusions = nn.ModuleList([
-        #     CrossAttentionFusion(32,  cli_dim=320, num_heads=4),   # 32 / 4 = 8 (head_dim)
-        #     CrossAttentionFusion(64,  cli_dim=320, num_heads=8),   # 64 / 8 = 8
-        #     CrossAttentionFusion(128, cli_dim=320, num_heads=8),   # 128 / 8 = 16
-        #     CrossAttentionFusion(256, cli_dim=320, num_heads=8),   # 256 / 8 = 32
-        #     CrossAttentionFusion(320, cli_dim=320, num_heads=8),   # 320 / 8 = 40
-        #     CrossAttentionFusion(320, cli_dim=320, num_heads=8)    # 320 / 8 = 40
-        # ])
-
-        # 反向版: 臨床 Query 影像 Key/Value (臨床指導)
         self.multiscale_fusions = nn.ModuleList([
-            CrossAttentionFusion_Reverse(32,  cli_dim=320, num_heads=4),   # 32 / 4 = 8 (head_dim)
-            CrossAttentionFusion_Reverse(64,  cli_dim=320, num_heads=8),   # 64 / 8 = 8
-            CrossAttentionFusion_Reverse(128, cli_dim=320, num_heads=8),   # 128 / 8 = 16
-            CrossAttentionFusion_Reverse(256, cli_dim=320, num_heads=8),   # 256 / 8 = 32
-            CrossAttentionFusion_Reverse(320, cli_dim=320, num_heads=8),   # 320 / 8 = 40
-            CrossAttentionFusion_Reverse(320, cli_dim=320, num_heads=8)    # 320 / 8 = 40
+            CrossAttentionFusion(32,  cli_dim=320, num_heads=4),   # 32 / 4 = 8 (head_dim)
+            CrossAttentionFusion(64,  cli_dim=320, num_heads=8),   # 64 / 8 = 8
+            CrossAttentionFusion(128, cli_dim=320, num_heads=8),   # 128 / 8 = 16
+            CrossAttentionFusion(256, cli_dim=320, num_heads=8),   # 256 / 8 = 32
+            CrossAttentionFusion(320, cli_dim=320, num_heads=8),   # 320 / 8 = 40
+            CrossAttentionFusion(320, cli_dim=320, num_heads=8)    # 320 / 8 = 40
         ])
+
+        # # 反向版: 臨床 Query 影像 Key/Value (臨床指導)
+        # self.multiscale_fusions = nn.ModuleList([
+        #     CrossAttentionFusion_Reverse(32,  cli_dim=320, num_heads=4),   # 32 / 4 = 8 (head_dim)
+        #     CrossAttentionFusion_Reverse(64,  cli_dim=320, num_heads=8),   # 64 / 8 = 8
+        #     CrossAttentionFusion_Reverse(128, cli_dim=320, num_heads=8),   # 128 / 8 = 16
+        #     CrossAttentionFusion_Reverse(256, cli_dim=320, num_heads=8),   # 256 / 8 = 32
+        #     CrossAttentionFusion_Reverse(320, cli_dim=320, num_heads=8),   # 320 / 8 = 40
+        #     CrossAttentionFusion_Reverse(320, cli_dim=320, num_heads=8)    # 320 / 8 = 40
+        # ])
 
         # # ---------- 門控混合 跳躍連結(skip)與臨床特徵 ----------
         # self.multiscale_fusions = nn.ModuleList([
@@ -692,6 +696,12 @@ class MyMultiModel(nn.Module):
             nn.Dropout(0.2),
             nn.Linear(64, self.missing_flag_m_stage)
         )
+        self.dataset_head = nn.Sequential(
+            nn.Linear(128, 64),
+            nn.LeakyReLU(0.01, inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(64, self.missing_flag_dataset)
+        )
 
 
         # 初始化權重
@@ -730,7 +740,7 @@ class MyMultiModel(nn.Module):
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
 
-    def forward(self, img, loc, t, n, m, text_descriptions):
+    def forward(self, img, loc, t, n, m, dataset, text_descriptions):
         """
         Args: 輸入模型時 需要全部為 tensor
             img:          [B, C, D, H, W]
@@ -738,6 +748,7 @@ class MyMultiModel(nn.Module):
             t:            [B]  整數索引 (含 Missing 索引)
             n:            [B]  整數索引 (含 Missing 索引)
             m:            [B]  整數索引 (含 Missing 索引)
+            dataset:      [B]  整數索引 (含 Missing 索引)
             text_descriptions:     [B]  文字描述列表
         Returns:
             seg_out:       [B, C, D, H, W] 分割頭
@@ -747,6 +758,7 @@ class MyMultiModel(nn.Module):
                     't_stage':  [B, C=5]
                     'n_stage':  [B, C=3]
                     'm_stage':  [B, C=2]
+                    'dataset':  [B, C=2]
                 }
         """
         # ---------- 影像編碼 ----------
@@ -767,8 +779,9 @@ class MyMultiModel(nn.Module):
         # t_emb   = self.emb_t(t)
         # n_emb   = self.emb_n(n)
         # m_emb   = self.emb_m(m)
-        # clinical_vec = torch.cat([loc_emb, t_emb, n_emb, m_emb], dim=1) # [B, C=8] -> [B, 8*4]
-        # clinical_feat = self.clinical_expand(clinical_vec) # [B, 8*4] -> [B, 320] (符合瓶頸層維度)
+        # dataset_emb = self.emb_dataset(dataset)
+        # clinical_vec = torch.cat([loc_emb, t_emb, n_emb, m_emb, dataset_emb], dim=1) # [B, C=8] -> [B, 8*5]
+        # clinical_feat = self.clinical_expand(clinical_vec) # [B, 8*5] -> [B, 320] (符合瓶頸層維度)
 
         # ---------- 文字 Embedding ----------
         # 使用獨立的文字編碼模組，不會被 torch.compile 編譯
@@ -800,6 +813,7 @@ class MyMultiModel(nn.Module):
         t_out = []   # 分類頭輸出 時間
         n_out = []   # 分類頭輸出 數量
         m_out = []   # 分類頭輸出 模式
+        dataset_out = [] # 分類頭輸出 資料集來源
 
         # 遍歷所有解碼器階段
         for i in range(len(self.decoder_stages)):
@@ -850,6 +864,7 @@ class MyMultiModel(nn.Module):
                 t_out.append(self.t_head(cli_raw_out))
                 n_out.append(self.n_head(cli_raw_out))
                 m_out.append(self.m_head(cli_raw_out))
+                dataset_out.append(self.dataset_head(cli_raw_out))
 
             # 如果關閉深度監督 但是最後一層解碼器 還是要輸出
             elif i == (len(self.decoder_stages) - 1):
@@ -862,6 +877,7 @@ class MyMultiModel(nn.Module):
                 t_out.append(self.t_head(cli_raw_out))
                 n_out.append(self.n_head(cli_raw_out))
                 m_out.append(self.m_head(cli_raw_out))
+                dataset_out.append(self.dataset_head(cli_raw_out))
 
         # 反轉輸出順序
         seg_out = seg_out[::-1] #[start, end, step]
@@ -869,13 +885,16 @@ class MyMultiModel(nn.Module):
         t_out = t_out[::-1]
         n_out = n_out[::-1]
         m_out = m_out[::-1]
+        dataset_out = dataset_out[::-1]
+
 
         # ---------- 屬性預測 ----------
         cli_out = {
             'location': loc_out, # loc_out[0] = [B, C=6]  (若啟動深度監督會有5個解析度的輸出)
             't_stage':  t_out,   # t_out[0] = [B, C=5]
             'n_stage':  n_out,   # n_out[0] = [B, C=3]
-            'm_stage':  m_out    # m_out[0] = [B, C=2]
+            'm_stage':  m_out,    # m_out[0] = [B, C=2]
+            'dataset':  dataset_out
         }
 
         # 如果關閉深度監督 只返回最後一層的輸出 (已經在前面設定 不用在這裡判斷是否啟用)

@@ -79,7 +79,8 @@ def preprocess_fromfiles_save_to_queue_multimodal(list_of_lists: List[List[str]]
                     'location': clinical_data_label_encoder.missing_flag_location,
                     't_stage': clinical_data_label_encoder.missing_flag_t_stage,
                     'n_stage': clinical_data_label_encoder.missing_flag_n_stage,
-                    'm_stage': clinical_data_label_encoder.missing_flag_m_stage
+                    'm_stage': clinical_data_label_encoder.missing_flag_m_stage,
+                    'dataset': clinical_data_label_encoder.missing_flag_dataset
                 }
 
                 # 讀取原始 CSV 檔案
@@ -140,14 +141,16 @@ def preprocess_fromfiles_save_to_queue_multimodal(list_of_lists: List[List[str]]
                 'location': missing_flags.get('location', -1),
                 't_stage': missing_flags.get('t_stage', -1),
                 'n_stage': missing_flags.get('n_stage', -1),
-                'm_stage': missing_flags.get('m_stage', -1)
+                'm_stage': missing_flags.get('m_stage', -1),
+                'dataset': missing_flags.get('dataset', -1)
             }
             
             clinical_mask = {
                 'location': False,
                 't_stage': False,
                 'n_stage': False,
-                'm_stage': False
+                'm_stage': False,
+                'dataset': False
             }
 
             row = None
@@ -184,12 +187,14 @@ def preprocess_fromfiles_save_to_queue_multimodal(list_of_lists: List[List[str]]
                         clinical_data['t_stage'] = row['T_stage'].values[0]
                         clinical_data['n_stage'] = row['N_stage'].values[0]
                         clinical_data['m_stage'] = row['M_stage'].values[0]
+                        clinical_data['dataset'] = row['Dataset'].values[0]
                         
                         # 設置掩碼，表示哪些特徵有效
                         clinical_mask['location'] = clinical_data['location'] != missing_flags.get('location', -1)
                         clinical_mask['t_stage'] = clinical_data['t_stage'] != missing_flags.get('t_stage', -1)
                         clinical_mask['n_stage'] = clinical_data['n_stage'] != missing_flags.get('n_stage', -1)
                         clinical_mask['m_stage'] = clinical_data['m_stage'] != missing_flags.get('m_stage', -1)
+                        clinical_mask['dataset'] = clinical_data['dataset'] != missing_flags.get('dataset', -1)
                     else:
                         # 找不到案例時，輸出警告並保持默認值（全部設為缺失）
                         if verbose:
