@@ -492,7 +492,8 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
                 self.ce_loss_t = DeepSupervisionWrapper(self.ce_loss_t, weights)
                 self.ce_loss_n = DeepSupervisionWrapper(self.ce_loss_n, weights)
                 self.ce_loss_m = DeepSupervisionWrapper(self.ce_loss_m, weights)
-                self.ce_loss_dataset = DeepSupervisionWrapper(self.ce_loss_dataset, weights)
+                # ✅ dataset predictor 不使用 deep supervision，因此不包裝
+                # self.ce_loss_dataset = DeepSupervisionWrapper(self.ce_loss_dataset, weights)
 
         else:
             # Dataset100 不傳遞 clinical_data_dir
@@ -707,9 +708,10 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
                     cli_out['m_stage'],
                     [m_label] * len(cli_out['m_stage']),
                 )
+                # ✅ dataset 現在是單一張量，不是 list，不使用深度監督
                 dataset_loss_tr = self.ce_loss_dataset(
-                    cli_out['dataset'],
-                    [dataset_label] * len(cli_out['dataset']),
+                    cli_out['dataset'],  # [B, num_dataset_classes]
+                    dataset_label,       # [B]
                 )
 
 
@@ -726,6 +728,7 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
                 t_loss_tr = self.ce_loss_t(cli_out['t_stage'], t_label)
                 n_loss_tr = self.ce_loss_n(cli_out['n_stage'], n_label)
                 m_loss_tr = self.ce_loss_m(cli_out['m_stage'], m_label)
+                # ✅ dataset 現在是單一張量，不是 list
                 dataset_loss_tr = self.ce_loss_dataset(cli_out['dataset'], dataset_label)
 
             # 只在每個 epoch 開始時計算梯度範數以減少計算負擔
@@ -1179,38 +1182,73 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
 
             # 計算損失
             if self.enable_deep_supervision:
-                loc_loss_val = self.focal_loss_loc(
+                # # focal loss
+                # loc_loss_val = self.focal_loss_loc(
+                #     cli_out['location'],           # list of tensor，每個分支一個 tensor
+                #     [loc_label] * len(cli_out['location']),  # list，每個分支都用同一個 label tensor
+                #     [loc_mask] * len(cli_out['location'])    # list，每個分支都用同一個 mask tensor
+                # )
+                # t_loss_val = self.focal_loss_t(
+                #     cli_out['t_stage'],
+                #     [t_label] * len(cli_out['t_stage']),
+                #     [t_mask] * len(cli_out['t_stage'])
+                # )
+                # n_loss_val = self.focal_loss_n(
+                #     cli_out['n_stage'],
+                #     [n_label] * len(cli_out['n_stage']),
+                #     [n_mask] * len(cli_out['n_stage'])
+                # )
+                # m_loss_val = self.focal_loss_m(
+                #     cli_out['m_stage'],
+                #     [m_label] * len(cli_out['m_stage']),
+                #     [m_mask] * len(cli_out['m_stage'])
+                # )
+                # # ✅ dataset 現在是單一張量，不是 list，不使用深度監督
+                # # 注意：validation 時也使用 CE loss 而非 focal loss，保持與訓練一致
+                # dataset_loss_val = self.focal_loss_dataset(
+                #     cli_out['dataset'],  # [B, num_dataset_classes]
+                #     dataset_label        # [B]
+                # )
+
+                # # ce loss
+                loc_loss_val = self.ce_loss_loc(
                     cli_out['location'],           # list of tensor，每個分支一個 tensor
-                    [loc_label] * len(cli_out['location']),  # list，每個分支都用同一個 label tensor
-                    [loc_mask] * len(cli_out['location'])    # list，每個分支都用同一個 mask tensor
+                    [loc_label] * len(cli_out['location'])  # list，每個分支都用同一個 label tensor
                 )
-                t_loss_val = self.focal_loss_t(
+                t_loss_val = self.ce_loss_t(
                     cli_out['t_stage'],
-                    [t_label] * len(cli_out['t_stage']),
-                    [t_mask] * len(cli_out['t_stage'])
+                    [t_label] * len(cli_out['t_stage'])
                 )
-                n_loss_val = self.focal_loss_n(
+                n_loss_val = self.ce_loss_n(
                     cli_out['n_stage'],
-                    [n_label] * len(cli_out['n_stage']),
-                    [n_mask] * len(cli_out['n_stage'])
+                    [n_label] * len(cli_out['n_stage'])
                 )
-                m_loss_val = self.focal_loss_m(
+                m_loss_val = self.ce_loss_m(
                     cli_out['m_stage'],
-                    [m_label] * len(cli_out['m_stage']),
-                    [m_mask] * len(cli_out['m_stage'])
+                    [m_label] * len(cli_out['m_stage'])
                 )
-                dataset_loss_val = self.focal_loss_dataset(
-                    cli_out['dataset'],
-                    [dataset_label] * len(cli_out['dataset']),
-                    [dataset_mask] * len(cli_out['dataset'])
+                # ✅ dataset 現在是單一張量，不是 list，不使用深度監督
+                dataset_loss_val = self.ce_loss_dataset(
+                    cli_out['dataset'],  # [B, num_dataset_classes]
+                    dataset_label        # [B]
                 )
 
             else:
-                loc_loss_val = self.focal_loss_loc(cli_out['location'], loc_label, loc_mask)
-                t_loss_val = self.focal_loss_t(cli_out['t_stage'], t_label, t_mask)
-                n_loss_val = self.focal_loss_n(cli_out['n_stage'], n_label, n_mask)
-                m_loss_val = self.focal_loss_m(cli_out['m_stage'], m_label, m_mask)
-                dataset_loss_val = self.focal_loss_dataset(cli_out['dataset'], dataset_label, dataset_mask)
+                # # focal loss
+                # loc_loss_val = self.focal_loss_loc(cli_out['location'], loc_label, loc_mask)
+                # t_loss_val = self.focal_loss_t(cli_out['t_stage'], t_label, t_mask)
+                # n_loss_val = self.focal_loss_n(cli_out['n_stage'], n_label, n_mask)
+                # m_loss_val = self.focal_loss_m(cli_out['m_stage'], m_label, m_mask)
+                # # ✅ dataset 現在是單一張量，不是 list
+                # dataset_loss_val = self.focal_loss_dataset(cli_out['dataset'], dataset_label)
+
+                # # ce loss
+                loc_loss_val = self.ce_loss_loc(cli_out['location'], loc_label)
+                t_loss_val = self.ce_loss_t(cli_out['t_stage'], t_label)
+                n_loss_val = self.ce_loss_n(cli_out['n_stage'], n_label)
+                m_loss_val = self.ce_loss_m(cli_out['m_stage'], m_label)
+                # ✅ dataset 現在是單一張量，不是 list
+                dataset_loss_val = self.ce_loss_dataset(cli_out['dataset'], dataset_label)
 
             # 計算準確率
             if self.enable_deep_supervision:
@@ -1219,12 +1257,14 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
                 t_logits   = cli_out['t_stage'][0]
                 n_logits   = cli_out['n_stage'][0]
                 m_logits   = cli_out['m_stage'][0]
-                dataset_logits = cli_out['dataset'][0]
+                # ✅ dataset 不是 list，直接使用
+                dataset_logits = cli_out['dataset']
             else:
                 loc_logits = cli_out['location']
                 t_logits   = cli_out['t_stage']
                 n_logits   = cli_out['n_stage']
                 m_logits   = cli_out['m_stage']
+                # ✅ dataset 不是 list，直接使用
                 dataset_logits = cli_out['dataset']
 
 

@@ -70,6 +70,7 @@ class nnUNetDataLoaderMultimodal(nnUNetDataLoader):
         t_stage_mapping = self.clinical_data_label_encoder.reverse_t_stage_mapping
         n_stage_mapping = self.clinical_data_label_encoder.reverse_n_stage_mapping
         m_stage_mapping = self.clinical_data_label_encoder.reverse_m_stage_mapping
+        dataset_mapping = self.clinical_data_label_encoder.reverse_dataset_mapping
         
         # 基礎描述
         base_text = "A computerized tomography scan reveals a colorectal cancer"
@@ -109,7 +110,7 @@ class nnUNetDataLoaderMultimodal(nnUNetDataLoader):
         # Dataset 描述
         if clinical_mask_dict['dataset']:
             dataset_idx = clinical_data_dict['dataset']
-            dataset_name = self.clinical_data_label_encoder.reverse_dataset_mapping[dataset_idx]
+            dataset_name = dataset_mapping[dataset_idx]
             if dataset_name != 'Missing':
                 feature_descriptions.append(f"from the {dataset_name} dataset")
         

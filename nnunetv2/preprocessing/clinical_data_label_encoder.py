@@ -56,12 +56,11 @@ class ClinicalDataLabelEncoder:
         }
 
         # 計算類別數量
-        self.num_location_classes = len(self.location_mapping)
-        self.num_t_stage_classes = len(self.t_stage_mapping)
-        self.num_n_stage_classes = len(self.n_stage_mapping)
-        self.num_m_stage_classes = len(self.m_stage_mapping)
-        self.num_dataset_classes = len(self.dataset_mapping)
-
+        self.num_location_classes = len(self.location_mapping) # 8
+        self.num_t_stage_classes = len(self.t_stage_mapping) # 6
+        self.num_n_stage_classes = len(self.n_stage_mapping) # 4
+        self.num_m_stage_classes = len(self.m_stage_mapping) # 3
+        self.num_dataset_classes = len(self.dataset_mapping) # 3
         # 設定缺失標記的索引 = 類別數量 - 1
         self.missing_flag_location = self.num_location_classes - 1
         self.missing_flag_t_stage = self.num_t_stage_classes - 1

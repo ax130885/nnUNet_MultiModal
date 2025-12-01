@@ -267,15 +267,16 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
             # 使用反向映射將索引轉回標籤
             labels = {}
             
+            # 調試: 檢查關鍵變量是否存在
+            if not hasattr(self, 'reverse_mappings') or self.reverse_mappings is None:
+                if self.verbose:
+                    print("警告: reverse_mappings 未初始化，使用預設值")
+            if not hasattr(self, 'missing_flags') or self.missing_flags is None:
+                if self.verbose:
+                    print("警告: missing_flags 未初始化，使用預設值")
+            
             if self.reverse_mappings and clinical_attr_preds:
                 try:
-                    # 先獲取 missing_flags 預測 (這決定哪些特徵應被視為缺失)
-                    if 'missing_flags' in clinical_attr_preds:
-                        missing_probs = torch.sigmoid(clinical_attr_preds['missing_flags']).cpu().numpy()
-                        missing_flags = (missing_probs > 0.5).tolist()
-                    else:
-                        missing_flags = [False, False, False, False]
-                    
                     # 獲取最大概率的類別索引
                     loc_idx = int(torch.argmax(clinical_attr_preds['location']).item())
                     t_idx = int(torch.argmax(clinical_attr_preds['t_stage']).item())
@@ -305,11 +306,11 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
                     dataset_missing_idx = self.missing_flags.get('dataset')
                     
                     # 如果 missing_flag 為 True 或特徵索引等於缺失值索引，則標記為 "Missing"
-                    loc_label = "Missing" if (missing_flags[0] or loc_idx == loc_missing_idx) else self.reverse_mappings['location'].get(loc_idx, 'Unknown')
-                    t_label = "Missing" if (missing_flags[1] or t_idx == t_missing_idx) else self.reverse_mappings['t_stage'].get(t_idx, 'Unknown')
-                    n_label = "Missing" if (missing_flags[2] or n_idx == n_missing_idx) else self.reverse_mappings['n_stage'].get(n_idx, 'Unknown')
-                    m_label = "Missing" if (missing_flags[3] or m_idx == m_missing_idx) else self.reverse_mappings['m_stage'].get(m_idx, 'Unknown')
-                    dataset_label = "Missing" if (missing_flags[4] or dataset_idx == dataset_missing_idx) else self.reverse_mappings['dataset'].get(dataset_idx, 'Unknown')
+                    loc_label = "Missing" if (loc_idx == loc_missing_idx) else self.reverse_mappings['location'].get(loc_idx, 'Unknown')
+                    t_label = "Missing" if (t_idx == t_missing_idx) else self.reverse_mappings['t_stage'].get(t_idx, 'Unknown')
+                    n_label = "Missing" if (n_idx == n_missing_idx) else self.reverse_mappings['n_stage'].get(n_idx, 'Unknown')
+                    m_label = "Missing" if (m_idx == m_missing_idx) else self.reverse_mappings['m_stage'].get(m_idx, 'Unknown')
+                    dataset_label = "Missing" if (dataset_idx == dataset_missing_idx) else self.reverse_mappings['dataset'].get(dataset_idx, 'Unknown')
                     
                     # 組織最終結果
                     labels = {
@@ -319,7 +320,6 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
                         "N_stage": n_label,
                         "M_stage": m_label,
                         "Dataset": dataset_label,
-                        "Missing_flags": missing_flags,
                         # 添加額外診斷資訊以便分析
                         "Debug_Info": {
                             "loc_probs": loc_probs.tolist(),

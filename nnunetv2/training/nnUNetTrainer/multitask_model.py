@@ -493,14 +493,14 @@ class MyMultiModel(nn.Module):
         self.num_t_stage_classes = encoder.num_t_stage_classes # 6
         self.num_n_stage_classes = encoder.num_n_stage_classes # 4
         self.num_m_stage_classes = encoder.num_m_stage_classes # 3
-        self.num_dataset_classes = encoder.num_dataset_classes # 2
+        self.num_dataset_classes = encoder.num_dataset_classes # 3
 
         # 讀取臨床資料的缺失idx
         self.missing_flag_location = encoder.missing_flag_location # 7
         self.missing_flag_t_stage = encoder.missing_flag_t_stage # 5
         self.missing_flag_n_stage = encoder.missing_flag_n_stage # 3
         self.missing_flag_m_stage = encoder.missing_flag_m_stage # 2
-        self.missing_flag_dataset = encoder.missing_flag_dataset # 1
+        self.missing_flag_dataset = encoder.missing_flag_dataset # 2
 
 
 
@@ -574,6 +574,22 @@ class MyMultiModel(nn.Module):
             nn.Linear(512, 320),
             nn.LayerNorm(320)
         )
+
+        # # ---------- Dataset 獨立預測頭（從瓶頸層直接預測）----------
+        # # 只使用純影像特徵，不融合文字，避免被文字長度等 spurious correlation 影響
+        # self.dataset_predictor_from_bottleneck = nn.Sequential(
+        #     nn.AdaptiveAvgPool3d(1),  # [B, 320, D, H, W] -> [B, 320, 1, 1, 1]
+        #     nn.Flatten(),              # [B, 320, 1, 1, 1] -> [B, 320]
+        #     nn.Linear(320, 128),
+        #     nn.BatchNorm1d(128),
+        #     nn.LeakyReLU(0.01, inplace=True),
+        #     nn.Dropout(0.2),
+        #     nn.Linear(128, 64),
+        #     nn.BatchNorm1d(64),
+        #     nn.LeakyReLU(0.01, inplace=True),
+        #     nn.Dropout(0.2),
+        #     nn.Linear(64, self.missing_flag_dataset)  # 輸出 dataset 類別數（不含 Missing）
+        # )
         
         # # 臨床特徵投影層，將所有embedding concate 後(dim=8*5)投影到與影像瓶頸層(dim=320)相同的通道數
         # self.clinical_expand = nn.Sequential(
@@ -754,11 +770,11 @@ class MyMultiModel(nn.Module):
             seg_out:       [B, C, D, H, W] 分割頭
             cli_out:       dict 包含臨床資料分類頭輸出
                 {
-                    'location': [B, C=6]
-                    't_stage':  [B, C=5]
-                    'n_stage':  [B, C=3]
-                    'm_stage':  [B, C=2]
-                    'dataset':  [B, C=2]
+                    'location': list of [B, C=6]  # 深度監督
+                    't_stage':  list of [B, C=5]
+                    'n_stage':  list of [B, C=3]
+                    'm_stage':  list of [B, C=2]
+                    'dataset':  [B, C=2]  # 單一預測，不使用深度監督
                 }
         """
         # ---------- 影像編碼 ----------
@@ -772,7 +788,11 @@ class MyMultiModel(nn.Module):
             skips.append(x) # 保存每層下採樣的embedding 用於跳躍連結
             # print(f"Stage: {i}, Input shape: {x.shape}")  # 調試輸出
             i += 1
-        bottleneck = skips[-1]
+        bottleneck = skips[-1]  # [B, 320, D, H, W]
+        
+        # # ✅ 新增：從純影像瓶頸層預測 dataset（不受文字影響）
+        # # 這裡在文字融合之前就完成預測，確保 dataset 分類只依賴影像特徵
+        # dataset_pred_from_bottleneck = self.dataset_predictor_from_bottleneck(bottleneck)  # [B, num_dataset_classes]
 
         # # ---------- 臨床 Embedding ----------
         # loc_emb = self.emb_loc(loc) # [B] -> [B, C=8]
@@ -813,7 +833,8 @@ class MyMultiModel(nn.Module):
         t_out = []   # 分類頭輸出 時間
         n_out = []   # 分類頭輸出 數量
         m_out = []   # 分類頭輸出 模式
-        dataset_out = [] # 分類頭輸出 資料集來源
+        # ✅ dataset_out 初始化為 None，只在最後一層解碼器賦值
+        dataset_out = None # 分類頭輸出 資料集來源
 
         # 遍歷所有解碼器階段
         for i in range(len(self.decoder_stages)):
@@ -859,12 +880,15 @@ class MyMultiModel(nn.Module):
                 seg_out.append(self.seg_layers[i](lres))
                 # 臨床資料輸出
                 cli_raw_out = (self.cli_layers[i](lres))
-                # 臨床資料分類頭
+                # 臨床資料分類頭（只有 location/T/N/M，不包括 dataset）
                 loc_out.append(self.loc_head(cli_raw_out))
                 t_out.append(self.t_head(cli_raw_out))
                 n_out.append(self.n_head(cli_raw_out))
                 m_out.append(self.m_head(cli_raw_out))
-                dataset_out.append(self.dataset_head(cli_raw_out))
+                # ✅ dataset 只在最後一層輸出，不使用深度監督
+                if i == (len(self.decoder_stages) - 1):
+                    dataset_out = self.dataset_head(cli_raw_out)  # [B, num_dataset_classes]
+
 
             # 如果關閉深度監督 但是最後一層解碼器 還是要輸出
             elif i == (len(self.decoder_stages) - 1):
@@ -872,29 +896,36 @@ class MyMultiModel(nn.Module):
                 seg_out.append(self.seg_layers[-1](lres))
                 # 臨床資料輸出
                 cli_raw_out = (self.cli_layers[-1](lres))
-                # 臨床資料分類頭
+                # 臨床資料分類頭（只有 location/T/N/M，不包括 dataset）
                 loc_out.append(self.loc_head(cli_raw_out))
                 t_out.append(self.t_head(cli_raw_out))
                 n_out.append(self.n_head(cli_raw_out))
                 m_out.append(self.m_head(cli_raw_out))
-                dataset_out.append(self.dataset_head(cli_raw_out))
+                dataset_out = self.dataset_head(cli_raw_out)  # [B, num_dataset_classes]
 
-        # 反轉輸出順序
+        # 反轉輸出順序（只有使用深度監督的特徵需要反轉）
         seg_out = seg_out[::-1] #[start, end, step]
         loc_out = loc_out[::-1]
         t_out = t_out[::-1]
         n_out = n_out[::-1]
         m_out = m_out[::-1]
-        dataset_out = dataset_out[::-1]
+        # dataset_out 是單一張量，不需要反轉
 
 
         # ---------- 屬性預測 ----------
+        # cli_out = {
+        #     'location': loc_out,  # list of [B, C=num_loc_classes]（深度監督）
+        #     't_stage':  t_out,    # list of [B, C=num_t_classes]
+        #     'n_stage':  n_out,    # list of [B, C=num_n_classes]
+        #     'm_stage':  m_out,    # list of [B, C=num_m_classes]
+        #     'dataset':  dataset_pred_from_bottleneck  # ✅ 單一張量 [B, C=num_dataset_classes]，不是 list
+        # }
         cli_out = {
-            'location': loc_out, # loc_out[0] = [B, C=6]  (若啟動深度監督會有5個解析度的輸出)
-            't_stage':  t_out,   # t_out[0] = [B, C=5]
-            'n_stage':  n_out,   # n_out[0] = [B, C=3]
-            'm_stage':  m_out,    # m_out[0] = [B, C=2]
-            'dataset':  dataset_out
+            'location': loc_out,  # list of [B, C=num_loc_classes]（深度監督）
+            't_stage':  t_out,    # list of [B, C=num_t_classes]
+            'n_stage':  n_out,    # list of [B, C=num_n_classes]
+            'm_stage':  m_out,    # list of [B, C=num_m_classes]
+            'dataset':  dataset_out  # ✅ 單一張量 [B, C=num_dataset_classes]，不是 list
         }
 
         # 如果關閉深度監督 只返回最後一層的輸出 (已經在前面設定 不用在這裡判斷是否啟用)
