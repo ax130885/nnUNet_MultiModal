@@ -224,12 +224,12 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
                 metastasis_desc = "with distant metastasis" if m_stage_name == "M1" else "without distant metastasis"
                 feature_descriptions.append(metastasis_desc)
 
-        # Dataset 描述
-        if clinical_mask_dict['dataset']:
-            dataset_idx = clinical_data_dict['dataset']
-            dataset_name = self.clinical_data_label_encoder.reverse_dataset_mapping[dataset_idx]
-            if dataset_name != 'Missing':
-                feature_descriptions.append(f"from the {dataset_name} dataset")
+        # # Dataset 描述
+        # if clinical_mask_dict['dataset']:
+        #     dataset_idx = clinical_data_dict['dataset']
+        #     dataset_name = self.clinical_data_label_encoder.reverse_dataset_mapping[dataset_idx]
+        #     if dataset_name != 'Missing':
+        #         feature_descriptions.append(f"from the {dataset_name} dataset")
         
         # 組合描述
         if feature_descriptions:
@@ -363,10 +363,16 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
 
 
         # 保存臨床預測結果 txt
-        def save_clinical_prediction_txt(ofile, clinical_attr_preds):
+        def save_clinical_prediction_txt(ofile, clinical_attr_preds, text_description=None):
             txt_path = ofile + ".txt"
             labels = clinical_logits_to_labels(clinical_attr_preds)
             with open(txt_path, "w") as f:
+                # 首先寫入文字描述（如果有的話）
+                if text_description:
+                    f.write("=== Generated Text Description ===\n")
+                    f.write(f"{text_description}\n")
+                    f.write("\n=== Clinical Predictions ===\n")
+                
                 for k, v in labels.items():
                     if k != "Case_Index":  # 跳過案例ID，因為它是從文件名中生成的
                         f.write(f"{k}: {v}\n")
@@ -515,17 +521,21 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
                     proceed = not check_workers_alive_and_busy(export_pool, worker_list, r, allowed_num_queued=4)
                 
                 # 呼叫修改後的預測邏輯，同時傳入影像數據和臨床特徵
-                # 它會返回分割的 logits 和臨床屬性預測的 logits
-                prediction_seg_logits, clinical_attr_preds = self.predict_logits_and_attributes_from_preprocessed_data(
+                # 它會返回分割的 logits、臨床屬性預測的 logits 和文字描述
+                prediction_seg_logits, clinical_attr_preds, text_description = self.predict_logits_and_attributes_from_preprocessed_data(
                     image_data, clinical_features
                 )
+                
+                # 打印生成的文字描述
+                if text_description:
+                    print(f'\n生成的文字描述: {text_description}')
                 
                 # 將分割預測結果的匯出工作放入背景行程池中執行 (非同步)
                 prediction_seg_logits = prediction_seg_logits.cpu().detach().numpy()
 
-                # 保存臨床預測 txt
+                # 保存臨床預測 txt (包含文字描述)
                 if ofile is not None:
-                    save_clinical_prediction_txt(ofile, clinical_attr_preds)
+                    save_clinical_prediction_txt(ofile, clinical_attr_preds, text_description)
 
                 # 收集到 all_clinical_results
                 case_id = os.path.basename(ofile) if ofile is not None else f"case_{i}"
@@ -617,10 +627,10 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
 
     @torch.inference_mode()
     def predict_logits_and_attributes_from_preprocessed_data(self, data: torch.Tensor, 
-                                                             clinical_features: dict) -> Tuple[torch.Tensor, dict]:
+                                                             clinical_features: dict) -> Tuple[torch.Tensor, dict, str]:
         """
         重要！如果是級聯模型，前階段分割必須已以 one-hot 編碼形式堆疊在影像頂部！
-        此方法同時返回分割的 logits 和臨床屬性預測的 logits。
+        此方法同時返回分割的 logits、臨床屬性預測的 logits 和生成的文字描述。
         
         Args:
             data (torch.Tensor): 預處理後的影像數據 (4D 張量)。
@@ -628,7 +638,7 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
                                      {'location': tensor, 't_stage': tensor, 'n_stage': tensor, 'm_stage': tensor, 'dataset': tensor}
             
         Returns:
-            Tuple[torch.Tensor, dict]: 包含分割 logits 和臨床屬性 logits 字典的元組。
+            Tuple[torch.Tensor, dict, str]: 包含分割 logits、臨床屬性 logits 字典和文字描述的元組。
         """
         n_threads = torch.get_num_threads()
         torch.set_num_threads(default_num_processes if default_num_processes < n_threads else n_threads)
@@ -661,6 +671,8 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
             # 生成文字描述
             text_description = self._generate_text_description(clinical_data_dict, clinical_mask_dict)
             text_descriptions = [text_description]  # 單個樣本的文字描述列表
+        else:
+            text_description = None
 
         # ensemble 用， list_of_parameters 其實是 list of 模型權重 (長度為 fold 數量)
         for params in self.list_of_parameters:
@@ -701,7 +713,7 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
         if self.verbose:
             print('預測完成')
         torch.set_num_threads(n_threads) # 恢復線程設置
-        return prediction_seg, prediction_cli
+        return prediction_seg, prediction_cli, text_description
 
     @torch.inference_mode()
     def _internal_maybe_mirror_and_predict(self, x: torch.Tensor, clinical_features: dict, text_descriptions=None) -> Tuple[torch.Tensor, dict]:

@@ -107,12 +107,12 @@ class nnUNetDataLoaderMultimodal(nnUNetDataLoader):
                 metastasis_desc = "with distant metastasis" if m_stage_name == "M1" else "without distant metastasis"
                 feature_descriptions.append(metastasis_desc)
 
-        # Dataset 描述
-        if clinical_mask_dict['dataset']:
-            dataset_idx = clinical_data_dict['dataset']
-            dataset_name = dataset_mapping[dataset_idx]
-            if dataset_name != 'Missing':
-                feature_descriptions.append(f"from the {dataset_name} dataset")
+        # # Dataset 描述
+        # if clinical_mask_dict['dataset']:
+        #     dataset_idx = clinical_data_dict['dataset']
+        #     dataset_name = dataset_mapping[dataset_idx]
+        #     if dataset_name != 'Missing':
+        #         feature_descriptions.append(f"from the {dataset_name} dataset")
         
         # 組合描述
         if feature_descriptions:
