@@ -49,6 +49,196 @@ class TextEncoderModule(nn.Module):
         # 這樣 BERT 完全不參與反向傳播，但下游層可以訓練
         return embeddings.clone().detach().requires_grad_()
 
+class GatedCrossAttentionFusion(nn.Module):
+    """
+    整合 Gated Attention 機制的 Cross Attention 融合模組
+    
+    核心創新：基於 NeurIPS 2025 Oral 論文的 Gated Attention 機制
+    
+    論文要點：
+    1. 非線性門控 (Non-linearity): 在 attention 輸出後應用 sigmoid 門控，引入非線性變換
+    2. 稀疏性 (Sparsity): 通過門控實現輸入依賴的稀疏性，動態調節資訊流
+    3. 無 Attention Sink (Attention-Sink-Free): 避免 attention 過度集中在某些 token
+    
+    實現方式：
+    - Headwise Gating: 每個 attention head 擁有獨立的門控標量
+    - 門控信號從 query 投影中額外輸出，與原始 query 一起計算
+    - 公式:  attn_output = attn_output * sigmoid(gate_score)
+    
+    適用場景：
+    - 影像特徵:  [B, C, D, H, W] 保留空間資訊
+    - 臨床特徵: [B, cli_dim] 全局語義資訊
+    - 讓每個空間位置自適應地決定需要多少臨床資訊
+    """
+    def __init__(self, channels:  int, cli_dim: int = 320, num_heads: int = 8, 
+                 dropout: float = 0.1, use_gating: bool = True):
+        """
+        Args:
+            channels:  影像特徵的通道數
+            cli_dim: 臨床特徵的維度
+            num_heads: attention head 的數量
+            dropout: dropout 比率
+            use_gating: 是否啟用 gated attention 機制
+        """
+        super().__init__()
+        self.channels = channels
+        self. num_heads = num_heads
+        self.head_dim = channels // num_heads
+        self.use_gating = use_gating
+        
+        assert channels % num_heads == 0, f"channels ({channels}) 必須能被 num_heads ({num_heads}) 整除"
+        
+        # ========== Gated Attention 核心實現 ==========
+        # 影像特徵投影 (作為 Query)
+        # 如果啟用 gating，額外輸出門控信號 (每個 head 一個標量)
+        if self.use_gating:
+            # 輸出維度:  channels (query) + num_heads (gate scores)
+            self.img_query = nn.Conv3d(channels, channels + num_heads, 1)
+        else:
+            self.img_query = nn.Conv3d(channels, channels, 1)
+        
+        # 臨床特徵投影 (作為 Key 和 Value)
+        # 將單一臨床向量擴展為多個"專家"，每個專家關注不同的臨床aspect
+        self.num_clinical_tokens = 4  # 臨床資訊分解為4個token
+        self.cli_key = nn.Sequential(
+            nn.Linear(cli_dim, channels * self.num_clinical_tokens),
+            nn.LayerNorm(channels * self. num_clinical_tokens)
+        )
+        self.cli_value = nn.Sequential(
+            nn.Linear(cli_dim, channels * self.num_clinical_tokens),
+            nn.LayerNorm(channels * self. num_clinical_tokens)
+        )
+        
+        # 輸出投影
+        self.out_proj = nn.Conv3d(channels, channels, 1)
+        
+        # Dropout
+        self.attn_dropout = nn.Dropout(dropout)
+        self.proj_dropout = nn.Dropout(dropout)
+        
+        # 後處理：融合原始影像特徵與注意力結果
+        self.fusion_conv = nn.Sequential(
+            nn.Conv3d(channels * 2, channels, 3, padding=1),
+            InstanceNorm3d(channels),
+            nn. GELU(),
+            nn.Dropout(dropout),
+            nn.Conv3d(channels, channels, 3, padding=1),
+            InstanceNorm3d(channels)
+        )
+        
+        # 縮放因子
+        self. scale = self.head_dim ** -0.5
+        
+        self.apply(self._init_weights)
+    
+    def _init_weights(self, m):
+        """初始化權重"""
+        if isinstance(m, (nn.Conv3d, nn.Linear)):
+            nn.init.kaiming_normal_(m.weight, nonlinearity='leaky_relu', a=0.01)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, (InstanceNorm3d, nn.LayerNorm)):
+            if m.weight is not None:
+                nn.init.constant_(m.weight, 1)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+    
+    def forward(self, img_feat, cli_feat):
+        """
+        img_feat :  [B, C, D, H, W]  影像空間特徵
+        cli_feat : [B, cli_dim]     臨床全局特徵
+        
+        Gated Attention 流程：
+        1. 從 query 投影中分離出 gate_score (每個 head 一個標量)
+        2. 計算標準的 scaled dot-product attention
+        3. 將 attention 輸出與 sigmoid(gate_score) 相乘，實現門控
+        4. 門控後的輸出與原始影像特徵融合
+        """
+        B, C, D, H, W = img_feat.shape
+        spatial_size = D * H * W
+        
+        # ========== 步驟 1: 投影 Query 並分離門控信號 ==========
+        if self.use_gating:
+            # 投影輸出:  [B, C + num_heads, D, H, W]
+            query_and_gate = self.img_query(img_feat)
+            
+            # 分離 query 和 gate_score
+            # query: [B, C, D, H, W]
+            # gate_score: [B, num_heads, D, H, W]
+            query = query_and_gate[:, : self.channels, :, : , :]
+            gate_score = query_and_gate[:, self.channels:, :, : , :]  # [B, num_heads, D, H, W]
+            
+            # 重塑 gate_score 為 [B, num_heads, D*H*W, 1]
+            # 每個 head 在每個空間位置都有一個門控標量
+            gate_score = gate_score.view(B, self.num_heads, spatial_size, 1)
+        else:
+            query = self.img_query(img_feat)  # [B, C, D, H, W]
+            gate_score = None
+        
+        # 重塑 query 為 multi-head 格式
+        # [B, C, D, H, W] -> [B, num_heads, head_dim, D*H*W]
+        query = query.view(B, self.num_heads, self.head_dim, spatial_size)
+        
+        # ========== 步驟 2: 投影 Key 和 Value ==========
+        # 臨床特徵投影為多個 Key 和 Value tokens
+        key_raw = self.cli_key(cli_feat)      # [B, C * num_tokens]
+        value_raw = self. cli_value(cli_feat)  # [B, C * num_tokens]
+        
+        # 重塑為 multi-head 格式
+        # [B, C * num_tokens] -> [B, num_heads, head_dim, num_tokens]
+        key = key_raw.view(B, self.num_heads, self.head_dim, self.num_clinical_tokens)
+        value = value_raw.view(B, self.num_heads, self.head_dim, self.num_clinical_tokens)
+        
+        # ========== 步驟 3: 計算 Scaled Dot-Product Attention ==========
+        # query:   [B, num_heads, head_dim, D*H*W]
+        # key:    [B, num_heads, head_dim, num_tokens]
+        # scores: [B, num_heads, D*H*W, num_tokens]
+        attn_scores = torch.matmul(query. transpose(-2, -1), key) * self.scale
+        
+        # 在臨床 tokens 維度上做 softmax
+        # 每個空間位置決定從哪些臨床 tokens 獲取資訊
+        attn_weights = torch.softmax(attn_scores, dim=-1)  # [B, num_heads, D*H*W, num_tokens]
+        attn_weights = self.attn_dropout(attn_weights)
+        
+        # ========== 步驟 4: 應用 Attention 到 Value ==========
+        # attn_weights: [B, num_heads, D*H*W, num_tokens]
+        # value:        [B, num_heads, head_dim, num_tokens]
+        # attn_output:   [B, num_heads, head_dim, D*H*W]
+        attn_output = torch.matmul(value, attn_weights.transpose(-2, -1))
+        
+        # ========== 步驟 5: 應用 Gated Attention 機制 ==========
+        if self.use_gating and gate_score is not None: 
+            # gate_score: [B, num_heads, D*H*W, 1]
+            # attn_output: [B, num_heads, head_dim, D*H*W]
+            
+            # 轉置 attn_output 以匹配 gate_score 的維度
+            # [B, num_heads, head_dim, D*H*W] -> [B, num_heads, D*H*W, head_dim]
+            attn_output = attn_output.transpose(-2, -1)
+            
+            # 應用門控：attn_output * sigmoid(gate_score)
+            # gate_score 會 broadcast 到 head_dim 維度
+            # 每個 head 的每個空間位置都有自己的門控值
+            attn_output = attn_output * torch.sigmoid(gate_score)
+            
+            # 轉回原始維度
+            # [B, num_heads, D*H*W, head_dim] -> [B, num_heads, head_dim, D*H*W]
+            attn_output = attn_output.transpose(-2, -1)
+        
+        # ========== 步驟 6: 重塑回空間形狀 ==========
+        # [B, num_heads, head_dim, D*H*W] -> [B, C, D, H, W]
+        attn_output = attn_output.contiguous().view(B, C, D, H, W)
+        attn_output = self.out_proj(attn_output)
+        attn_output = self.proj_dropout(attn_output)
+        
+        # ========== 步驟 7: 融合原始影像特徵與注意力增強特徵 ==========
+        fused = torch.cat([img_feat, attn_output], dim=1)  # [B, 2C, D, H, W]
+        out = self.fusion_conv(fused)  # [B, C, D, H, W]
+        
+        # ========== 步驟 8: 殘差連接 ==========
+        out = out + img_feat
+        
+        return out
+
 
 class CrossAttentionFusion(nn.Module):
     """
@@ -599,16 +789,33 @@ class MyMultiModel(nn.Module):
         # )
 
 
-        # ---------- Cross Attention 混合 跳躍連結(skip)與臨床特徵 ----------
-        # 原版: 影像 Query 臨床 Key/Value (空間適應性)
+        # ---------- Gated Cross Attention 融合模組 ----------
+        # 根據 NeurIPS 2025 Oral 論文實現的 Gated Attention
+        # 論文核心貢獻：
+        # 1. 非線性門控提升模型表達能力
+        # 2. 輸入依賴的稀疏性提高訓練穩定性
+        # 3. 避免 Attention Sink 現象，改善長序列處理
+        self.use_gated_attention = True  # 設為 False 可切換回原始版本
+
         self.multiscale_fusions = nn.ModuleList([
-            CrossAttentionFusion(32,  cli_dim=320, num_heads=4),   # 32 / 4 = 8 (head_dim)
-            CrossAttentionFusion(64,  cli_dim=320, num_heads=8),   # 64 / 8 = 8
-            CrossAttentionFusion(128, cli_dim=320, num_heads=8),   # 128 / 8 = 16
-            CrossAttentionFusion(256, cli_dim=320, num_heads=8),   # 256 / 8 = 32
-            CrossAttentionFusion(320, cli_dim=320, num_heads=8),   # 320 / 8 = 40
-            CrossAttentionFusion(320, cli_dim=320, num_heads=8)    # 320 / 8 = 40
+            GatedCrossAttentionFusion(32,  cli_dim=320, num_heads=4, use_gating=self.use_gated_attention),
+            GatedCrossAttentionFusion(64,  cli_dim=320, num_heads=8, use_gating=self. use_gated_attention),
+            GatedCrossAttentionFusion(128, cli_dim=320, num_heads=8, use_gating=self. use_gated_attention),
+            GatedCrossAttentionFusion(256, cli_dim=320, num_heads=8, use_gating=self. use_gated_attention),
+            GatedCrossAttentionFusion(320, cli_dim=320, num_heads=8, use_gating=self. use_gated_attention),
+            GatedCrossAttentionFusion(320, cli_dim=320, num_heads=8, use_gating=self. use_gated_attention)
         ])
+
+        # # ---------- Cross Attention 混合 跳躍連結(skip)與臨床特徵 ----------
+        # # 原版: 影像 Query 臨床 Key/Value (空間適應性)
+        # self.multiscale_fusions = nn.ModuleList([
+        #     CrossAttentionFusion(32,  cli_dim=320, num_heads=4),   # 32 / 4 = 8 (head_dim)
+        #     CrossAttentionFusion(64,  cli_dim=320, num_heads=8),   # 64 / 8 = 8
+        #     CrossAttentionFusion(128, cli_dim=320, num_heads=8),   # 128 / 8 = 16
+        #     CrossAttentionFusion(256, cli_dim=320, num_heads=8),   # 256 / 8 = 32
+        #     CrossAttentionFusion(320, cli_dim=320, num_heads=8),   # 320 / 8 = 40
+        #     CrossAttentionFusion(320, cli_dim=320, num_heads=8)    # 320 / 8 = 40
+        # ])
 
         # # 反向版: 臨床 Query 影像 Key/Value (臨床指導)
         # self.multiscale_fusions = nn.ModuleList([
@@ -945,6 +1152,7 @@ if __name__ == "__main__":
     t = torch.tensor([3, 1]).to(device)    # B 1，batch 1 輸入 3，batch 2 輸入 1
     n = torch.tensor([2, 0]).to(device)    # B 1，batch 1 輸入 2，batch 2 輸入 0
     m = torch.tensor([1, 0]).to(device)    # B 1，batch 1 輸入 1，batch 2 輸入 0
+    dataset = torch.tensor([1, 0]).to(device)  # B 1，batch 1 輸入 1，batch 2 輸入 0
     
     # 文字描述 (訓練用假資料)
     text_descriptions_train = [
@@ -958,6 +1166,7 @@ if __name__ == "__main__":
     t_gt   = torch.randint(0, model.missing_flag_t_stage,   (2,)).to(device)
     n_gt   = torch.randint(0, model.missing_flag_n_stage,   (2,)).to(device)
     m_gt   = torch.randint(0, model.missing_flag_m_stage,   (2,)).to(device)
+    dataset_gt = torch.randint(0, model.missing_flag_dataset, (2,)).to(device)
 
     # -------------------- loss & optimizer --------------------
     seg_criterion = nn.CrossEntropyLoss()
@@ -969,7 +1178,7 @@ if __name__ == "__main__":
     for epoch in range(1, epochs+1):
         optimizer.zero_grad()
 
-        seg_out, cli_out = model(img, loc, t, n, m, text_descriptions_train)  # 前向傳播
+        seg_out, cli_out = model(img, loc, t, n, m, dataset, text_descriptions_train)  # 前向傳播
 
         # 分割 loss：取最後一層（關閉 deep_supervision 時）
         if isinstance(seg_out, list):
@@ -982,8 +1191,9 @@ if __name__ == "__main__":
         t_loss   = cls_criterion(cli_out['t_stage'][-1],   t_gt)
         n_loss   = cls_criterion(cli_out['n_stage'][-1],   n_gt)
         m_loss   = cls_criterion(cli_out['m_stage'][-1],   m_gt)
+        dataset_loss = cls_criterion(cli_out['dataset'], dataset_gt)
 
-        loss = seg_loss + loc_loss + t_loss + n_loss + m_loss
+        loss = seg_loss + loc_loss + t_loss + n_loss + m_loss + dataset_loss
         loss.backward()
         optimizer.step()
 
@@ -992,7 +1202,7 @@ if __name__ == "__main__":
     # -------------------- 推論示範 --------------------
     with torch.no_grad():
         model.eval()
-        seg_out, cli_out = model(img, loc, t, n, m, text_descriptions_train)  # 前向傳播
+        seg_out, cli_out = model(img, loc, t, n, m, dataset, text_descriptions_train)  # 前向傳播
         print("\n=== eval shapes ===")
         for seg in (seg_out if isinstance(seg_out, list) else [seg_out]):
             print("seg:", seg.shape)
