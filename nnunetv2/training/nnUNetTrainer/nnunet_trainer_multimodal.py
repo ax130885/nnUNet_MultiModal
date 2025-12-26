@@ -198,7 +198,11 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
             # 如果使用 DDP，則包裝網路
             if self.is_ddp:
                 self.network = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.network)
-                self.network = nn.parallel.DistributedDataParallel(self.network, device_ids=[self.local_rank])
+                self.network = nn.parallel.DistributedDataParallel(
+                    self.network, 
+                    device_ids=[self.local_rank],
+                    find_unused_parameters=True  # 允許有些參數不參與梯度計算（如文字編碼器被凍結時）
+                )
 
             # 構建損失函數
             self.loss = self._build_loss()
