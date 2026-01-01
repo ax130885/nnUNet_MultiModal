@@ -133,11 +133,25 @@ class GatedCrossAttentionFusion(nn.Module):
         self.apply(self._init_weights)
     
     def _init_weights(self, m):
-        """初始化權重"""
+        """
+        初始化權重 - 遵循 Qwen3 官方實作
+        
+        官方策略 (modeling_qwen3.py L732-742):
+        - Linear/Conv: normal_(mean=0.0, std=0.02)
+        - bias: zero_()
+        - Embedding: normal_(mean=0.0, std=0.02)
+        
+        這確保 gate logits 初始值接近 0，使 sigmoid(0) ≈ 0.5
+        避免 gate 初始時過度抑制或放大資訊流
+        """
+        initializer_range = 0.02  # Qwen3 默認值
+        
         if isinstance(m, (nn.Conv3d, nn.Linear)):
-            nn.init.kaiming_normal_(m.weight, nonlinearity='leaky_relu', a=0.01)
+            # 使用標準高斯初始化 (與 Qwen3 一致)
+            nn.init.normal_(m.weight, mean=0.0, std=initializer_range)
             if m.bias is not None:
-                nn.init.constant_(m.bias, 0)
+                nn.init.zeros_(m.bias)  # bias 初始化為 0
+                
         elif isinstance(m, (InstanceNorm3d, nn.LayerNorm)):
             if m.weight is not None:
                 nn.init.constant_(m.weight, 1)
@@ -152,38 +166,35 @@ class GatedCrossAttentionFusion(nn.Module):
         
         Returns:
             out: [B, C, D, H, W] 融合後的特徵
+            
+        關鍵修正：Gate 必須應用在 SDPA 輸出之後，而非之前！
+        論文核心：Query-dependent sparse gate AFTER the SDPA output (G1)
         """
         B, C, D, H, W = img_feat.shape
         spatial_size = D * H * W
         
-        # ========== 步驟 1: Query 投影與門控信號分離 ==========
+        # ========== 步驟 1: Query 投影（包含潛在的 gate 參數）==========
         query_proj = self.img_query(img_feat)  # 形狀取決於 gating_mode
         
+        # 分離 query 和 gate 的 logits（未激活的門控值）
         if self.gating_mode == 'none':
-            # Baseline: 無門控
             query = query_proj  # [B, C, D, H, W]
-            gate_score = None
+            gate_logits = None
             
         elif self.gating_mode == 'headwise':
-            # Headwise: 分離 query 和 gate_score
-            # query_proj:  [B, C + num_heads, D, H, W]
-            query = query_proj[:, :self.channels, :, : , :]  # [B, C, D, H, W]
-            gate_score = query_proj[:, self.channels:, :, : , :]  # [B, num_heads, D, H, W]
+            # query_proj: [B, C + num_heads, D, H, W]
+            query = query_proj[:, :self.channels, :, :, :]  # [B, C, D, H, W]
+            gate_logits = query_proj[:, self.channels:, :, :, :]  # [B, num_heads, D, H, W]
+            # 重塑：[B, num_heads, D*H*W, 1] - 每個 head 每個位置一個標量
+            gate_logits = gate_logits.view(B, self.num_heads, spatial_size, 1)
             
-            # 重塑為 [B, num_heads, spatial, 1]
-            # 每個 head 在每個空間位置有一個門控標量
-            gate_score = gate_score.view(B, self.num_heads, spatial_size, 1)
-            
-        elif self.gating_mode == 'elementwise': 
-            # Elementwise: 分離 query 和 gate_score
+        elif self.gating_mode == 'elementwise':
             # query_proj: [B, 2*C, D, H, W]
-            query = query_proj[: , :self.channels, :, :, :]  # [B, C, D, H, W]
-            gate_score = query_proj[:, self. channels:, :, :, :]  # [B, C, D, H, W]
-            
-            # 重塑為 [B, num_heads, spatial, head_dim]
-            # 每個元素都有獨立的門控值
-            gate_score = gate_score.view(B, self. num_heads, self.head_dim, spatial_size)
-            gate_score = gate_score.transpose(-2, -1)  # [B, num_heads, spatial, head_dim]
+            query = query_proj[:, :self.channels, :, :, :]  # [B, C, D, H, W]
+            gate_logits = query_proj[:, self.channels:, :, :, :]  # [B, C, D, H, W]
+            # 重塑：[B, num_heads, D*H*W, head_dim] - 每個元素一個值
+            gate_logits = gate_logits.view(B, self.num_heads, self.head_dim, spatial_size)
+            gate_logits = gate_logits.transpose(-2, -1)  # [B, num_heads, D*H*W, head_dim]
         
         # 重塑 query 為 multi-head 格式
         query = query.view(B, self.num_heads, self.head_dim, spatial_size)
@@ -195,34 +206,39 @@ class GatedCrossAttentionFusion(nn.Module):
         key = key_raw.view(B, self.num_heads, self.head_dim, self.num_clinical_tokens)
         value = value_raw.view(B, self.num_heads, self.head_dim, self.num_clinical_tokens)
         
-        # ========== 步驟 3: Scaled Dot-Product Attention ==========
-        attn_scores = torch.matmul(query. transpose(-2, -1), key) * self.scale
+        # ========== 步驟 3: Scaled Dot-Product Attention (SDPA) ==========
+        # 這是完整的 SDPA，沒有任何門控
+        attn_scores = torch.matmul(query.transpose(-2, -1), key) * self.scale  # [B, H, spatial, tokens]
         attn_weights = torch.softmax(attn_scores, dim=-1)
         attn_weights = self.attn_dropout(attn_weights)
         
-        # ========== 步驟 4: 應用 Attention ==========
-        attn_output = torch.matmul(value, attn_weights.transpose(-2, -1))
-        # attn_output:  [B, num_heads, head_dim, spatial]
+        # ========== 步驟 4: 計算 SDPA 輸出 ==========
+        # 這是純粹的 attention 輸出，未經門控
+        attn_output = torch.matmul(value, attn_weights.transpose(-2, -1))  # [B, H, head_dim, spatial]
         
-        # ========== 步驟 5: 應用門控機制 ==========
-        if self.gating_mode != 'none' and gate_score is not None:
-            # 轉置以便應用門控
-            attn_output = attn_output.transpose(-2, -1)  # [B, num_heads, spatial, head_dim]
+        # ========== 步驟 5: 應用門控機制到 SDPA 輸出（論文核心）==========
+        # ⭐ 關鍵：Gate 應用在 SDPA 輸出，這引入非線性和稀疏性
+        if self.gating_mode != 'none' and gate_logits is not None:
+            # 轉置以便應用門控：[B, H, head_dim, spatial] -> [B, H, spatial, head_dim]
+            attn_output = attn_output.transpose(-2, -1)
+            
+            # 應用 sigmoid 門控（query-dependent sparse gating）
+            gate = torch.sigmoid(gate_logits)
             
             if self.gating_mode == 'headwise':
-                # gate_score: [B, num_heads, spatial, 1]
-                # broadcast 到 head_dim 維度
-                attn_output = attn_output * torch.sigmoid(gate_score)
+                # gate: [B, H, spatial, 1] - broadcast 到所有 head_dim
+                # 每個 head 共享同一個門控標量
+                attn_output = attn_output * gate
                 
-            elif self.gating_mode == 'elementwise': 
-                # gate_score: [B, num_heads, spatial, head_dim]
-                # 逐元素相乘
-                attn_output = attn_output * torch.sigmoid(gate_score)
+            elif self.gating_mode == 'elementwise':
+                # gate: [B, H, spatial, head_dim] - 逐元素相乘
+                # 每個元素獨立門控（最大表達能力）
+                attn_output = attn_output * gate
             
-            # 轉回原始維度
-            attn_output = attn_output.transpose(-2, -1)  # [B, num_heads, head_dim, spatial]
+            # 轉回：[B, H, spatial, head_dim] -> [B, H, head_dim, spatial]
+            attn_output = attn_output.transpose(-2, -1)
         
-        # ========== 步驟 6: 重塑回空間形狀 ==========
+        # ========== 步驟 6: 輸出投影 ==========
         attn_output = attn_output.contiguous().view(B, C, D, H, W)
         attn_output = self.out_proj(attn_output)
         attn_output = self.proj_dropout(attn_output)
