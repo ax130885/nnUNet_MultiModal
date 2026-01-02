@@ -70,7 +70,7 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
                  verbose_preprocessing: bool = False, # 是否輸出預處理詳細日誌
                  allow_tqdm: bool = True,     # 是否允許顯示進度條
                  clinical_data_dir: str = None,
-                 no_use_input_cli_data: bool = False): # 推論時 不輸入臨床資料):
+                 no_use_input_cli_data: bool = False): # 推論時 不輸入臨床資料
         super().__init__(tile_step_size, use_gaussian, use_mirroring,
                          perform_everything_on_device, device, verbose,
                          verbose_preprocessing, allow_tqdm)

@@ -674,11 +674,13 @@ class MyMultiModel(nn.Module):
                  num_classes: int = 2,
                  deep_supervision: bool = True,
                  clinical_csv_dir: str = '/home/admin/yuxin/data/Lab/model/UNet_base/nnunet_ins_data/data_test/nnUNet_raw/Dataset101',
-                 freeze_bert: bool = True):
+                 freeze_bert: bool = True,
+                 use_nm_stages: bool = True):
         super().__init__()
         self.input_channels = input_channels
         self.num_classes = num_classes
         self.deep_supervision = deep_supervision
+        self.use_nm_stages = use_nm_stages  # 是否使用 N 和 M stage
 
         # 用 DummyDecoder 只存 deep_supervision 屬性，避免遞迴
         class _DummyDecoder:
@@ -692,15 +694,15 @@ class MyMultiModel(nn.Module):
         # 讀取臨床資料的類別數
         self.num_location_classes = encoder.num_location_classes # 8
         self.num_t_stage_classes = encoder.num_t_stage_classes # 6
-        self.num_n_stage_classes = encoder.num_n_stage_classes # 4
-        self.num_m_stage_classes = encoder.num_m_stage_classes # 3
+        self.num_n_stage_classes = encoder.num_n_stage_classes if use_nm_stages else 0 # 4
+        self.num_m_stage_classes = encoder.num_m_stage_classes if use_nm_stages else 0 # 3
         self.num_dataset_classes = encoder.num_dataset_classes # 3
 
         # 讀取臨床資料的缺失idx
         self.missing_flag_location = encoder.missing_flag_location # 7
         self.missing_flag_t_stage = encoder.missing_flag_t_stage # 5
-        self.missing_flag_n_stage = encoder.missing_flag_n_stage # 3
-        self.missing_flag_m_stage = encoder.missing_flag_m_stage # 2
+        self.missing_flag_n_stage = encoder.missing_flag_n_stage if use_nm_stages else 0 # 3
+        self.missing_flag_m_stage = encoder.missing_flag_m_stage if use_nm_stages else 0 # 2
         self.missing_flag_dataset = encoder.missing_flag_dataset # 2
 
 
@@ -763,8 +765,9 @@ class MyMultiModel(nn.Module):
         # padding_idx 確保缺失值的嵌入向量為零
         self.emb_loc = nn.Embedding(self.num_location_classes, 8, padding_idx=self.missing_flag_location)
         self.emb_t   = nn.Embedding(self.num_t_stage_classes, 8, padding_idx=self.missing_flag_t_stage)
-        self.emb_n   = nn.Embedding(self.num_n_stage_classes, 8, padding_idx=self.missing_flag_n_stage)
-        self.emb_m   = nn.Embedding(self.num_m_stage_classes, 8, padding_idx=self.missing_flag_m_stage)
+        if self.use_nm_stages:
+            self.emb_n   = nn.Embedding(self.num_n_stage_classes, 8, padding_idx=self.missing_flag_n_stage)
+            self.emb_m   = nn.Embedding(self.num_m_stage_classes, 8, padding_idx=self.missing_flag_m_stage)
 
         # text_descriptions 投影層 - 改進版
         self.text_expand = nn.Sequential(
@@ -806,7 +809,7 @@ class MyMultiModel(nn.Module):
         # 1. 非線性門控提升模型表達能力
         # 2. 輸入依賴的稀疏性提高訓練穩定性
         # 3. 避免 Attention Sink 現象，改善長序列處理
-        self.gating_mode = "elementwise" # "none":原始 cross attention, 'headwise': 頭級門控 (推薦，平衡效能), 'elementwise': 元素級門控 (最強表達能力)
+        self.gating_mode = "headwise" # "none":原始 cross attention, 'headwise': 頭級門控 (推薦，平衡效能), 'elementwise': 元素級門控 (最強表達能力)
 
         self.multiscale_fusions = nn.ModuleList([
             GatedCrossAttentionFusion(32,  cli_dim=320, num_heads=4, gating_mode=self.gating_mode),
@@ -918,18 +921,19 @@ class MyMultiModel(nn.Module):
             nn.Dropout(0.2),
             nn.Linear(64, self.missing_flag_t_stage)
         )
-        self.n_head = nn.Sequential(
-            nn.Linear(128, 64),
-            nn.LeakyReLU(0.01, inplace=True),
-            nn.Dropout(0.2),
-            nn.Linear(64, self.missing_flag_n_stage)
-        )
-        self.m_head = nn.Sequential(
-            nn.Linear(128, 64),
-            nn.LeakyReLU(0.01, inplace=True),
-            nn.Dropout(0.2),
-            nn.Linear(64, self.missing_flag_m_stage)
-        )
+        if self.use_nm_stages:
+            self.n_head = nn.Sequential(
+                nn.Linear(128, 64),
+                nn.LeakyReLU(0.01, inplace=True),
+                nn.Dropout(0.2),
+                nn.Linear(64, self.missing_flag_n_stage)
+            )
+            self.m_head = nn.Sequential(
+                nn.Linear(128, 64),
+                nn.LeakyReLU(0.01, inplace=True),
+                nn.Dropout(0.2),
+                nn.Linear(64, self.missing_flag_m_stage)
+            )
         self.dataset_head = nn.Sequential(
             nn.Linear(128, 64),
             nn.LeakyReLU(0.01, inplace=True),
@@ -1101,8 +1105,9 @@ class MyMultiModel(nn.Module):
                 # 臨床資料分類頭（只有 location/T/N/M，不包括 dataset）
                 loc_out.append(self.loc_head(cli_raw_out))
                 t_out.append(self.t_head(cli_raw_out))
-                n_out.append(self.n_head(cli_raw_out))
-                m_out.append(self.m_head(cli_raw_out))
+                if self.use_nm_stages:
+                    n_out.append(self.n_head(cli_raw_out))
+                    m_out.append(self.m_head(cli_raw_out))
                 # ✅ dataset 只在最後一層輸出，不使用深度監督
                 if i == (len(self.decoder_stages) - 1):
                     dataset_out = self.dataset_head(cli_raw_out)  # [B, num_dataset_classes]
@@ -1117,16 +1122,18 @@ class MyMultiModel(nn.Module):
                 # 臨床資料分類頭（只有 location/T/N/M，不包括 dataset）
                 loc_out.append(self.loc_head(cli_raw_out))
                 t_out.append(self.t_head(cli_raw_out))
-                n_out.append(self.n_head(cli_raw_out))
-                m_out.append(self.m_head(cli_raw_out))
+                if self.use_nm_stages:
+                    n_out.append(self.n_head(cli_raw_out))
+                    m_out.append(self.m_head(cli_raw_out))
                 dataset_out = self.dataset_head(cli_raw_out)  # [B, num_dataset_classes]
 
         # 反轉輸出順序（只有使用深度監督的特徵需要反轉）
         seg_out = seg_out[::-1] #[start, end, step]
         loc_out = loc_out[::-1]
         t_out = t_out[::-1]
-        n_out = n_out[::-1]
-        m_out = m_out[::-1]
+        if self.use_nm_stages:
+            n_out = n_out[::-1]
+            m_out = m_out[::-1]
         # dataset_out 是單一張量，不需要反轉
 
 
@@ -1141,8 +1148,8 @@ class MyMultiModel(nn.Module):
         cli_out = {
             'location': loc_out,  # list of [B, C=num_loc_classes]（深度監督）
             't_stage':  t_out,    # list of [B, C=num_t_classes]
-            'n_stage':  n_out,    # list of [B, C=num_n_classes]
-            'm_stage':  m_out,    # list of [B, C=num_m_classes]
+            'n_stage':  n_out if self.use_nm_stages else None,    # list of [B, C=num_n_classes] or None
+            'm_stage':  m_out if self.use_nm_stages else None,    # list of [B, C=num_m_classes] or None
             'dataset':  dataset_out  # ✅ 單一張量 [B, C=num_dataset_classes]，不是 list
         }
 
@@ -1157,7 +1164,8 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # -------------------- 模型 & 假資料 --------------------
-    model = MyMultiModel(input_channels=1, num_classes=2).to(device)
+    # use_nm_stages=False 可以禁用 N 和 M stage
+    model = MyMultiModel(input_channels=1, num_classes=2, use_nm_stages=True).to(device)
     img = torch.randn(2, 1, 64, 64, 64).to(device)          # B C D H W
     loc = torch.tensor([5, 2]).to(device)  # B 1，batch 1 輸入 5，batch 2 輸入 2
     t = torch.tensor([3, 1]).to(device)    # B 1，batch 1 輸入 3，batch 2 輸入 1
@@ -1275,7 +1283,8 @@ if __name__ == "__main__":
     print("="*50)
     
     # 重新建立模型實例，確保乾淨狀態
-    model_test = MyMultiModel(input_channels=1, num_classes=2).to(device)
+    # 可以設置 use_nm_stages=False 來測試不使用 N/M stage 的情況
+    model_test = MyMultiModel(input_channels=1, num_classes=2, use_nm_stages=True).to(device)
     
     # 準備完整輸入數據
     batch_size = 2

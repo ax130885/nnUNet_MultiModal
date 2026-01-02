@@ -56,7 +56,8 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
     並處理多任務損失、評估以及兩階段訓練的邏輯。
     """
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
-                 device: torch.device = torch.device('cuda')):
+                 device: torch.device = torch.device('cuda'),
+                 use_nm_stages: bool = True):
         """
         初始化多模態 Trainer。
         Args:
@@ -65,10 +66,16 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
             fold (int): 交叉驗證的折數。
             dataset_json (dict): dataset.json 的內容。
             device (torch.device): 訓練設備 (例如 'cuda')。
+            use_nm_stages (bool): 是否使用 N 和 M stage 臨床特徵。
         """
         super().__init__(plans, configuration, fold, dataset_json, device)
 
         print("nnUNetTrainerMultimodal 初始化開始...")
+        
+        # 父類初始化後，手動添加 use_nm_stages 到 my_init_kwargs
+        self.use_nm_stages = use_nm_stages
+        self.my_init_kwargs['use_nm_stages'] = use_nm_stages
+        print(f"使用 N 和 M stage: {self.use_nm_stages}")
 
         # 定義臨床資料資料夾路徑
         # 假設 Dataset101 的臨床資料儲存在 nnUNet_raw/Dataset101/crcCTlist.csv
@@ -183,7 +190,11 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
                 'num_classes': self.label_manager.num_segmentation_heads,
                 'deep_supervision': self.enable_deep_supervision,
                 'clinical_csv_dir': self.clinical_data_dir,  # 臨床資料資料夾
+                'use_nm_stages': self.use_nm_stages,  # 是否使用 N 和 M stage
             }
+            # 保存到實例變量以便在 save_checkpoint 時使用
+            self.my_init_kwargs = my_model_init_kwargs
+            
             self.network = self.build_network_architecture(MyMultiModel, my_model_init_kwargs).to(self.device)
 
             # 編譯網路 (如果支援且啟用)
@@ -418,22 +429,25 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
             # focal loss 臨床特徵用
             self.focal_loss_loc = FocalLoss(alpha=self.clinical_class_weights["Location"], gamma=2.0, reduction='masked_mean')
             self.focal_loss_t = FocalLoss(alpha=self.clinical_class_weights["T_stage"], gamma=2.0, reduction='masked_mean')
-            self.focal_loss_n = FocalLoss(alpha=self.clinical_class_weights["N_stage"], gamma=2.0, reduction='masked_mean')
-            self.focal_loss_m = FocalLoss(alpha=self.clinical_class_weights["M_stage"], gamma=2.0, reduction='masked_mean')
+            if self.use_nm_stages:
+                self.focal_loss_n = FocalLoss(alpha=self.clinical_class_weights["N_stage"], gamma=2.0, reduction='masked_mean')
+                self.focal_loss_m = FocalLoss(alpha=self.clinical_class_weights["M_stage"], gamma=2.0, reduction='masked_mean')
             self.focal_loss_dataset = FocalLoss(alpha=self.clinical_class_weights["dataset"], gamma=2.0, reduction='masked_mean')
 
             # ce loss 臨床特徵用
             self.loc_weight = torch.tensor(self.clinical_class_weights["Location"], device=self.device)
             self.t_weight = torch.tensor(self.clinical_class_weights["T_stage"], device=self.device)
-            self.n_weight = torch.tensor(self.clinical_class_weights["N_stage"], device=self.device)
-            self.m_weight = torch.tensor(self.clinical_class_weights["M_stage"], device=self.device)
+            if self.use_nm_stages:
+                self.n_weight = torch.tensor(self.clinical_class_weights["N_stage"], device=self.device)
+                self.m_weight = torch.tensor(self.clinical_class_weights["M_stage"], device=self.device)
             self.dataset_weight = torch.tensor(self.clinical_class_weights["dataset"], device=self.device)
 
             if self.local_rank == 0:
                 print(f"Location 權重張量: {self.loc_weight}")
                 print(f"T_stage 權重張量: {self.t_weight}")
-                print(f"N_stage 權重張量: {self.n_weight}")
-                print(f"M_stage 權重張量: {self.m_weight}")
+                if self.use_nm_stages:
+                    print(f"N_stage 權重張量: {self.n_weight}")
+                    print(f"M_stage 權重張量: {self.m_weight}")
                 print(f"Dataset 權重張量: {self.dataset_weight}")
 
             # 設置交叉熵損失 (CE Loss)
@@ -448,16 +462,17 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
                 reduction='mean',
                 ignore_index=dataset_tr.clinical_data_label_encoder.missing_flag_t_stage
             )
-            self.ce_loss_n = nn.CrossEntropyLoss(
-                weight=self.n_weight, 
-                reduction='mean',
-                ignore_index=dataset_tr.clinical_data_label_encoder.missing_flag_n_stage
-            )
-            self.ce_loss_m = nn.CrossEntropyLoss(
-                weight=self.m_weight, 
-                reduction='mean',
-                ignore_index=dataset_tr.clinical_data_label_encoder.missing_flag_m_stage
-            )
+            if self.use_nm_stages:
+                self.ce_loss_n = nn.CrossEntropyLoss(
+                    weight=self.n_weight, 
+                    reduction='mean',
+                    ignore_index=dataset_tr.clinical_data_label_encoder.missing_flag_n_stage
+                )
+                self.ce_loss_m = nn.CrossEntropyLoss(
+                    weight=self.m_weight, 
+                    reduction='mean',
+                    ignore_index=dataset_tr.clinical_data_label_encoder.missing_flag_m_stage
+                )
             self.ce_loss_dataset = nn.CrossEntropyLoss(
                 weight=self.dataset_weight, 
                 reduction='mean',
@@ -477,8 +492,9 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
                 weights = weights / weights.sum()
                 self.focal_loss_loc = DeepSupervisionWrapper(self.focal_loss_loc, weights)
                 self.focal_loss_t = DeepSupervisionWrapper(self.focal_loss_t, weights)
-                self.focal_loss_n = DeepSupervisionWrapper(self.focal_loss_n, weights)
-                self.focal_loss_m = DeepSupervisionWrapper(self.focal_loss_m, weights)
+                if self.use_nm_stages:
+                    self.focal_loss_n = DeepSupervisionWrapper(self.focal_loss_n, weights)
+                    self.focal_loss_m = DeepSupervisionWrapper(self.focal_loss_m, weights)
                 self.focal_loss_dataset = DeepSupervisionWrapper(self.focal_loss_dataset, weights)
 
 
@@ -494,8 +510,9 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
                 weights = weights / weights.sum()
                 self.ce_loss_loc = DeepSupervisionWrapper(self.ce_loss_loc, weights)
                 self.ce_loss_t = DeepSupervisionWrapper(self.ce_loss_t, weights)
-                self.ce_loss_n = DeepSupervisionWrapper(self.ce_loss_n, weights)
-                self.ce_loss_m = DeepSupervisionWrapper(self.ce_loss_m, weights)
+                if self.use_nm_stages:
+                    self.ce_loss_n = DeepSupervisionWrapper(self.ce_loss_n, weights)
+                    self.ce_loss_m = DeepSupervisionWrapper(self.ce_loss_m, weights)
                 # ✅ dataset predictor 不使用 deep supervision，因此不包裝
                 # self.ce_loss_dataset = DeepSupervisionWrapper(self.ce_loss_dataset, weights)
 
@@ -730,8 +747,12 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
                 # ce loss
                 loc_loss_tr = self.ce_loss_loc(cli_out['location'], loc_label)
                 t_loss_tr = self.ce_loss_t(cli_out['t_stage'], t_label)
-                n_loss_tr = self.ce_loss_n(cli_out['n_stage'], n_label)
-                m_loss_tr = self.ce_loss_m(cli_out['m_stage'], m_label)
+                if self.use_nm_stages:
+                    n_loss_tr = self.ce_loss_n(cli_out['n_stage'], n_label)
+                    m_loss_tr = self.ce_loss_m(cli_out['m_stage'], m_label)
+                else:
+                    n_loss_tr = torch.tensor(0.0, device=self.device)
+                    m_loss_tr = torch.tensor(0.0, device=self.device)
                 # ✅ dataset 現在是單一張量，不是 list
                 dataset_loss_tr = self.ce_loss_dataset(cli_out['dataset'], dataset_label)
 
@@ -741,16 +762,21 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
                 seg_grad_norm = self._calculate_grad_norm(seg_loss_tr, "seg")
                 loc_grad_norm = self._calculate_grad_norm(loc_loss_tr, "location")
                 t_grad_norm = self._calculate_grad_norm(t_loss_tr, "t_stage")
-                n_grad_norm = self._calculate_grad_norm(n_loss_tr, "n_stage")
-                m_grad_norm = self._calculate_grad_norm(m_loss_tr, "m_stage")
+                if self.use_nm_stages:
+                    n_grad_norm = self._calculate_grad_norm(n_loss_tr, "n_stage")
+                    m_grad_norm = self._calculate_grad_norm(m_loss_tr, "m_stage")
+                else:
+                    n_grad_norm = 0.0
+                    m_grad_norm = 0.0
                 dataset_grad_norm = self._calculate_grad_norm(dataset_loss_tr, "dataset")
                 
                 # 更新 grad norm 的 EMA
                 self._update_ema_grad_norm('seg', seg_grad_norm) # 更新 self.ema_grad_norm[key]
                 self._update_ema_grad_norm('location', loc_grad_norm)
                 self._update_ema_grad_norm('t_stage', t_grad_norm)
-                self._update_ema_grad_norm('n_stage', n_grad_norm)
-                self._update_ema_grad_norm('m_stage', m_grad_norm)
+                if self.use_nm_stages:
+                    self._update_ema_grad_norm('n_stage', n_grad_norm)
+                    self._update_ema_grad_norm('m_stage', m_grad_norm)
                 self._update_ema_grad_norm('dataset', dataset_grad_norm)
                 
                 # 防止除以零
@@ -815,8 +841,12 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
             final_loss_seg = seg_weight * self.grad_norm_factors['seg'] * seg_loss_tr
             final_loss_loc = self.clinical_loss_manual_weights['location'] * self.grad_norm_factors['location'] * loc_loss_tr
             final_loss_t = self.clinical_loss_manual_weights['t_stage'] * self.grad_norm_factors['t_stage'] * t_loss_tr
-            final_loss_n = self.clinical_loss_manual_weights['n_stage'] * self.grad_norm_factors['n_stage'] * n_loss_tr
-            final_loss_m = self.clinical_loss_manual_weights['m_stage'] * self.grad_norm_factors['m_stage'] * m_loss_tr
+            if self.use_nm_stages:
+                final_loss_n = self.clinical_loss_manual_weights['n_stage'] * self.grad_norm_factors['n_stage'] * n_loss_tr
+                final_loss_m = self.clinical_loss_manual_weights['m_stage'] * self.grad_norm_factors['m_stage'] * m_loss_tr
+            else:
+                final_loss_n = torch.tensor(0.0, device=self.device)
+                final_loss_m = torch.tensor(0.0, device=self.device)
             final_loss_dataset = self.clinical_loss_manual_weights['dataset'] * self.grad_norm_factors['dataset'] * dataset_loss_tr
 
             # --- 最終總損失 ---
@@ -1223,14 +1253,18 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
                     cli_out['t_stage'],
                     [t_label] * len(cli_out['t_stage'])
                 )
-                n_loss_val = self.ce_loss_n(
-                    cli_out['n_stage'],
-                    [n_label] * len(cli_out['n_stage'])
-                )
-                m_loss_val = self.ce_loss_m(
-                    cli_out['m_stage'],
-                    [m_label] * len(cli_out['m_stage'])
-                )
+                if self.use_nm_stages:
+                    n_loss_val = self.ce_loss_n(
+                        cli_out['n_stage'],
+                        [n_label] * len(cli_out['n_stage'])
+                    )
+                    m_loss_val = self.ce_loss_m(
+                        cli_out['m_stage'],
+                        [m_label] * len(cli_out['m_stage'])
+                    )
+                else:
+                    n_loss_val = torch.tensor(0.0, device=self.device)
+                    m_loss_val = torch.tensor(0.0, device=self.device)
                 # ✅ dataset 現在是單一張量，不是 list，不使用深度監督
                 dataset_loss_val = self.ce_loss_dataset(
                     cli_out['dataset'],  # [B, num_dataset_classes]
@@ -1249,8 +1283,12 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
                 # # ce loss
                 loc_loss_val = self.ce_loss_loc(cli_out['location'], loc_label)
                 t_loss_val = self.ce_loss_t(cli_out['t_stage'], t_label)
-                n_loss_val = self.ce_loss_n(cli_out['n_stage'], n_label)
-                m_loss_val = self.ce_loss_m(cli_out['m_stage'], m_label)
+                if self.use_nm_stages:
+                    n_loss_val = self.ce_loss_n(cli_out['n_stage'], n_label)
+                    m_loss_val = self.ce_loss_m(cli_out['m_stage'], m_label)
+                else:
+                    n_loss_val = torch.tensor(0.0, device=self.device)
+                    m_loss_val = torch.tensor(0.0, device=self.device)
                 # ✅ dataset 現在是單一張量，不是 list
                 dataset_loss_val = self.ce_loss_dataset(cli_out['dataset'], dataset_label)
 
@@ -1287,19 +1325,25 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
             t_correct_valid = t_correct & t_valid
             t_acc_val = t_correct_valid.float().sum() / t_valid.sum().clamp(min=1)
 
-            # n_stage
-            n_preds = n_logits.argmax(dim=1)
-            n_correct = (n_preds == n_label)
-            n_valid = n_mask.bool()
-            n_correct_valid = n_correct & n_valid
-            n_acc_val = n_correct_valid.float().sum() / n_valid.sum().clamp(min=1)
+            # n_stage (條件性)
+            if self.use_nm_stages:
+                n_preds = n_logits.argmax(dim=1)
+                n_correct = (n_preds == n_label)
+                n_valid = n_mask.bool()
+                n_correct_valid = n_correct & n_valid
+                n_acc_val = n_correct_valid.float().sum() / n_valid.sum().clamp(min=1)
+            else:
+                n_acc_val = torch.tensor(0.0, device=self.device)
 
-            # m_stage
-            m_preds = m_logits.argmax(dim=1)
-            m_correct = (m_preds == m_label)
-            m_valid = m_mask.bool()
-            m_correct_valid = m_correct & m_valid
-            m_acc_val = m_correct_valid.float().sum() / m_valid.sum().clamp(min=1)
+            # m_stage (條件性)
+            if self.use_nm_stages:
+                m_preds = m_logits.argmax(dim=1)
+                m_correct = (m_preds == m_label)
+                m_valid = m_mask.bool()
+                m_correct_valid = m_correct & m_valid
+                m_acc_val = m_correct_valid.float().sum() / m_valid.sum().clamp(min=1)
+            else:
+                m_acc_val = torch.tensor(0.0, device=self.device)
 
             # dataset
             dataset_preds = dataset_logits.argmax(dim=1)
@@ -1314,8 +1358,12 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
             final_loss_seg = seg_weight * self.grad_norm_factors['seg'] * seg_loss_val
             final_loss_loc = self.clinical_loss_manual_weights['location'] * self.grad_norm_factors['location'] * loc_loss_val
             final_loss_t = self.clinical_loss_manual_weights['t_stage'] * self.grad_norm_factors['t_stage'] * t_loss_val
-            final_loss_n = self.clinical_loss_manual_weights['n_stage'] * self.grad_norm_factors['n_stage'] * n_loss_val
-            final_loss_m = self.clinical_loss_manual_weights['m_stage'] * self.grad_norm_factors['m_stage'] * m_loss_val
+            if self.use_nm_stages:
+                final_loss_n = self.clinical_loss_manual_weights['n_stage'] * self.grad_norm_factors['n_stage'] * n_loss_val
+                final_loss_m = self.clinical_loss_manual_weights['m_stage'] * self.grad_norm_factors['m_stage'] * m_loss_val
+            else:
+                final_loss_n = torch.tensor(0.0, device=self.device)
+                final_loss_m = torch.tensor(0.0, device=self.device)
             final_loss_dataset = self.clinical_loss_manual_weights['dataset'] * self.grad_norm_factors['dataset'] * dataset_loss_val
 
             # 最終總損失

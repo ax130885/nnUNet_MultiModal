@@ -109,7 +109,10 @@ class nnUNetTrainer(object):
         # need. So let's save the init args
         self.my_init_kwargs = {}
         for k in inspect.signature(self.__init__).parameters.keys():
-            self.my_init_kwargs[k] = locals()[k]
+            # 支持子類添加額外參數：如果參數在父類的 locals() 中不存在，則跳過
+            # 子類應該在 super().__init__() 之後手動添加這些參數到 my_init_kwargs
+            if k in locals():
+                self.my_init_kwargs[k] = locals()[k]
 
         ###  Saving all the init args into class variables for later access
         self.plans_manager = PlansManager(plans)
