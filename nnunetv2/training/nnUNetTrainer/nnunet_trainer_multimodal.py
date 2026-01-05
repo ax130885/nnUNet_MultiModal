@@ -192,8 +192,6 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
                 'clinical_csv_dir': self.clinical_data_dir,  # 臨床資料資料夾
                 'use_nm_stages': self.use_nm_stages,  # 是否使用 N 和 M stage
             }
-            # 保存到實例變量以便在 save_checkpoint 時使用
-            self.my_init_kwargs = my_model_init_kwargs
             
             self.network = self.build_network_architecture(MyMultiModel, my_model_init_kwargs).to(self.device)
 
@@ -721,14 +719,18 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
                     cli_out['t_stage'],
                     [t_label] * len(cli_out['t_stage']),
                 )
-                n_loss_tr = self.ce_loss_n(
-                    cli_out['n_stage'],
-                    [n_label] * len(cli_out['n_stage']),
-                )
-                m_loss_tr = self.ce_loss_m(
-                    cli_out['m_stage'],
-                    [m_label] * len(cli_out['m_stage']),
-                )
+                if self.use_nm_stages:
+                    n_loss_tr = self.ce_loss_n(
+                        cli_out['n_stage'],
+                        [n_label] * len(cli_out['n_stage']),
+                    )
+                    m_loss_tr = self.ce_loss_m(
+                        cli_out['m_stage'],
+                        [m_label] * len(cli_out['m_stage']),
+                    )
+                else:
+                    n_loss_tr = torch.tensor(0.0, device=self.device)
+                    m_loss_tr = torch.tensor(0.0, device=self.device)
                 # ✅ dataset 現在是單一張量，不是 list，不使用深度監督
                 dataset_loss_tr = self.ce_loss_dataset(
                     cli_out['dataset'],  # [B, num_dataset_classes]
@@ -1297,15 +1299,23 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
                 # 只取最高解析度分支 (通常是 list[0])
                 loc_logits = cli_out['location'][0]
                 t_logits   = cli_out['t_stage'][0]
-                n_logits   = cli_out['n_stage'][0]
-                m_logits   = cli_out['m_stage'][0]
+                if self.use_nm_stages:
+                    n_logits   = cli_out['n_stage'][0]
+                    m_logits   = cli_out['m_stage'][0]
+                else:
+                    n_logits = None
+                    m_logits = None
                 # ✅ dataset 不是 list，直接使用
                 dataset_logits = cli_out['dataset']
             else:
                 loc_logits = cli_out['location']
                 t_logits   = cli_out['t_stage']
-                n_logits   = cli_out['n_stage']
-                m_logits   = cli_out['m_stage']
+                if self.use_nm_stages:
+                    n_logits   = cli_out['n_stage']
+                    m_logits   = cli_out['m_stage']
+                else:
+                    n_logits = None
+                    m_logits = None
                 # ✅ dataset 不是 list，直接使用
                 dataset_logits = cli_out['dataset']
 
@@ -1633,6 +1643,7 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
                     'clinical_loss_manual_weights': self.clinical_loss_manual_weights if hasattr(self, 'clinical_loss_manual_weights') else None,
                     'grad_norm_factors': self.grad_norm_factors if hasattr(self, 'grad_norm_factors') else None,
                     'is_stage2_dataset': self.is_stage2_dataset if hasattr(self, 'is_stage2_dataset') else None,
+                    'use_nm_stages': self.use_nm_stages,  # 保存 N/M stage 是否啟用的狀態
                 }
                 torch.save(checkpoint, filename)
             else:

@@ -676,11 +676,11 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
 
         # ensemble 用， list_of_parameters 其實是 list of 模型權重 (長度為 fold 數量)
         for params in self.list_of_parameters:
-            # 加載模型參數
+            # 加載模型參數 - 使用 strict=False 以相容不同訓練設定
             if not isinstance(self.network, OptimizedModule):
-                self.network.load_state_dict(params)
+                self.network.load_state_dict(params, strict=False)
             else:
-                self.network._orig_mod.load_state_dict(params) # 處理編譯後模型
+                self.network._orig_mod.load_state_dict(params, strict=False) # 處理編譯後模型
 
             # 呼叫修改後的 predict_sliding_window_return_logits，傳入影像和臨床特徵
             seg_logits_single_model, cli_logits_single_model = self.predict_sliding_window_return_logits(
@@ -1332,12 +1332,28 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
             )
             if i == 0:
                 trainer_name = checkpoint['trainer_name']
-                configuration_name = checkpoint['init_args']['configuration']
+                # 容錯處理：兼容舊版本 checkpoint（可能缺少 configuration）
+                if 'init_args' in checkpoint and 'configuration' in checkpoint['init_args']:
+                    configuration_name = checkpoint['init_args']['configuration']
+                else:
+                    # 從 plans 中獲取配置，優先使用 3d_fullres
+                    available_configs = list(plans_manager.plans['configurations'].keys())
+                    if '3d_fullres' in available_configs:
+                        configuration_name = '3d_fullres'
+                    else:
+                        configuration_name = available_configs[0]
+                    print(f"⚠️  Warning: checkpoint 缺少 configuration 參數，自動使用: {configuration_name}")
+                
                 inference_allowed_mirroring_axes = checkpoint.get(
                     'inference_allowed_mirroring_axes', None
                 )
 
             parameters.append(checkpoint['network_weights'])
+            
+            # 讀取 use_nm_stages 狀態（如果 checkpoint 中沒有，默認為 True）
+            if i == 0:
+                use_nm_stages = checkpoint.get('use_nm_stages', True)
+                print(f"從 checkpoint 讀取 use_nm_stages: {use_nm_stages}")
 
         # 3. 建立計劃與配置管理器
         configuration_manager = plans_manager.get_configuration(configuration_name)
@@ -1355,12 +1371,13 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
         if trainer_class is None:
             raise RuntimeError(f'找不到訓練器類別 {trainer_name}')
 
-        # 建立模型
+        # 建立模型，傳遞 use_nm_stages 參數
         my_model_init_kwargs = {
             'input_channels': num_input_channels_img,
             'num_classes': plans_manager.get_label_manager(dataset_json).num_segmentation_heads,
             'deep_supervision': False,
-            'clinical_csv_dir': self.clinical_data_dir
+            'clinical_csv_dir': self.clinical_data_dir,
+            'use_nm_stages': use_nm_stages  # 傳遞 N/M stage 開關
         }
         
         # 打印模型初始化參數
@@ -1368,8 +1385,12 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
         
         network = trainer_class.build_network_architecture(MyMultiModel, my_model_init_kwargs).to(self.device)
 
-        # 加載網絡權重
-        network.load_state_dict(parameters[0])
+        # 加載網絡權重 - 使用 strict=False 以相容不同訓練設定
+        missing_keys, unexpected_keys = network.load_state_dict(parameters[0], strict=False)
+        if missing_keys:
+            print(f"警告：模型載入時缺少以下 keys（可能是因為訓練時使用了 --disable_nm_stages）：{missing_keys}")
+        if unexpected_keys:
+            print(f"警告：模型載入時出現未預期的 keys：{unexpected_keys}")
         self.network = network
 
         # 6. 儲存其餘必要屬性
@@ -1464,6 +1485,8 @@ def predict_entry_point_multimodal():
                         help='限制處理的案例數量（用於測試或調試）')
     parser.add_argument('--no_use_input_cli_data', action='store_true', default=False, 
                         help='不使用輸入的臨床資料')
+    parser.add_argument('--disable_nm_stages', action='store_true', default=False,
+                        help='停用 N 和 M stage 的分類任務（需與訓練時設定一致）')
 
 
     print(

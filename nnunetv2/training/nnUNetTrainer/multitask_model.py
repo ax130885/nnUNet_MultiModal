@@ -803,33 +803,33 @@ class MyMultiModel(nn.Module):
         # )
 
 
-        # ---------- Gated Cross Attention 融合模組 ----------
-        # 根據 NeurIPS 2025 Oral 論文實現的 Gated Attention
-        # 論文核心貢獻：
-        # 1. 非線性門控提升模型表達能力
-        # 2. 輸入依賴的稀疏性提高訓練穩定性
-        # 3. 避免 Attention Sink 現象，改善長序列處理
-        self.gating_mode = "headwise" # "none":原始 cross attention, 'headwise': 頭級門控 (推薦，平衡效能), 'elementwise': 元素級門控 (最強表達能力)
+        # # ---------- Gated Cross Attention 融合模組 ----------
+        # # 根據 NeurIPS 2025 Oral 論文實現的 Gated Attention
+        # # 論文核心貢獻：
+        # # 1. 非線性門控提升模型表達能力
+        # # 2. 輸入依賴的稀疏性提高訓練穩定性
+        # # 3. 避免 Attention Sink 現象，改善長序列處理
+        # self.gating_mode = "headwise" # "none":原始 cross attention, 'headwise': 頭級門控 (推薦，平衡效能), 'elementwise': 元素級門控 (最強表達能力)
 
-        self.multiscale_fusions = nn.ModuleList([
-            GatedCrossAttentionFusion(32,  cli_dim=320, num_heads=4, gating_mode=self.gating_mode),
-            GatedCrossAttentionFusion(64,  cli_dim=320, num_heads=8, gating_mode=self.gating_mode),
-            GatedCrossAttentionFusion(128, cli_dim=320, num_heads=8, gating_mode=self.gating_mode),
-            GatedCrossAttentionFusion(256, cli_dim=320, num_heads=8, gating_mode=self.gating_mode),
-            GatedCrossAttentionFusion(320, cli_dim=320, num_heads=8, gating_mode=self.gating_mode),
-            GatedCrossAttentionFusion(320, cli_dim=320, num_heads=8, gating_mode=self.gating_mode)
-        ])
-
-        # # ---------- Cross Attention 混合 跳躍連結(skip)與臨床特徵 ----------
-        # # 原版: 影像 Query 臨床 Key/Value (空間適應性)
         # self.multiscale_fusions = nn.ModuleList([
-        #     CrossAttentionFusion(32,  cli_dim=320, num_heads=4),   # 32 / 4 = 8 (head_dim)
-        #     CrossAttentionFusion(64,  cli_dim=320, num_heads=8),   # 64 / 8 = 8
-        #     CrossAttentionFusion(128, cli_dim=320, num_heads=8),   # 128 / 8 = 16
-        #     CrossAttentionFusion(256, cli_dim=320, num_heads=8),   # 256 / 8 = 32
-        #     CrossAttentionFusion(320, cli_dim=320, num_heads=8),   # 320 / 8 = 40
-        #     CrossAttentionFusion(320, cli_dim=320, num_heads=8)    # 320 / 8 = 40
+        #     GatedCrossAttentionFusion(32,  cli_dim=320, num_heads=4, gating_mode=self.gating_mode),
+        #     GatedCrossAttentionFusion(64,  cli_dim=320, num_heads=8, gating_mode=self.gating_mode),
+        #     GatedCrossAttentionFusion(128, cli_dim=320, num_heads=8, gating_mode=self.gating_mode),
+        #     GatedCrossAttentionFusion(256, cli_dim=320, num_heads=8, gating_mode=self.gating_mode),
+        #     GatedCrossAttentionFusion(320, cli_dim=320, num_heads=8, gating_mode=self.gating_mode),
+        #     GatedCrossAttentionFusion(320, cli_dim=320, num_heads=8, gating_mode=self.gating_mode)
         # ])
+
+        # ---------- Cross Attention 混合 跳躍連結(skip)與臨床特徵 ----------
+        # 原版: 影像 Query 臨床 Key/Value (空間適應性)
+        self.multiscale_fusions = nn.ModuleList([
+            CrossAttentionFusion(32,  cli_dim=320, num_heads=4),   # 32 / 4 = 8 (head_dim)
+            CrossAttentionFusion(64,  cli_dim=320, num_heads=8),   # 64 / 8 = 8
+            CrossAttentionFusion(128, cli_dim=320, num_heads=8),   # 128 / 8 = 16
+            CrossAttentionFusion(256, cli_dim=320, num_heads=8),   # 256 / 8 = 32
+            CrossAttentionFusion(320, cli_dim=320, num_heads=8),   # 320 / 8 = 40
+            CrossAttentionFusion(320, cli_dim=320, num_heads=8)    # 320 / 8 = 40
+        ])
 
         # # 反向版: 臨床 Query 影像 Key/Value (臨床指導)
         # self.multiscale_fusions = nn.ModuleList([
