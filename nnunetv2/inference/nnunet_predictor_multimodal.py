@@ -191,6 +191,10 @@ class nnUNetPredictorMultimodal(nnUNetPredictor):
         
         # 基礎描述
         base_text = "A computerized tomography scan reveals a colorectal cancer"
+        # base_text = "A computerized tomography scan is being examined for possible colorectal cancer tumor"
+        # base_text = "A CT scan is evaluated to determine whether a colorectal cancer tumor is present"
+        # base_text = "Analyze the CT scan to check for colorectal cancer tumor"
+
         
         # 收集有效的特徵描述
         feature_descriptions = []
