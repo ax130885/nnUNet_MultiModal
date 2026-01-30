@@ -137,7 +137,14 @@ class DefaultPreprocessor(object):
 
         # if possible, load seg
         if seg_file is not None:
-            seg, _ = rw.read_seg(seg_file)
+            # 【修改】檢查 label 檔案是否存在，如果不存在則生成空 label（negative data）
+            if not isfile(seg_file):
+                # Negative data: 無腫瘤，生成全零 segmentation
+                # 使用 int16 而非 uint8，因為 crop_to_nonzero 可能需要賦值 -1
+                seg = np.zeros((1, *data.shape[1:]), dtype=np.int16)
+                # print(f"✓ Negative data detected (preprocessor): {seg_file} 不存在，生成空 label")
+            else:
+                seg, _ = rw.read_seg(seg_file)
         else:
             seg = None
 
@@ -265,12 +272,34 @@ class DefaultPreprocessor(object):
 
         output_directory = join(nnUNet_preprocessed, dataset_name, configuration_manager.data_identifier)
 
-        if isdir(output_directory):
-            shutil.rmtree(output_directory)
+        # 【修改】支援斷點續傳：不刪除整個資料夾，只處理缺失的文件
+        # if isdir(output_directory):
+        #     shutil.rmtree(output_directory)
 
         maybe_mkdir_p(output_directory)
 
         dataset = get_filenames_of_train_images_and_targets(join(nnUNet_raw, dataset_name), dataset_json)
+
+        # 【新增】檢查哪些文件已經處理完成
+        already_processed = []
+        keys_to_process = []
+        for k in dataset.keys():
+            output_file_data = join(output_directory, k) + '.b2nd'
+            output_file_seg = join(output_directory, k) + '_seg.b2nd'
+            output_file_pkl = join(output_directory, k) + '.pkl'
+            
+            # 如果三個文件都存在，認為已經處理完成
+            if isfile(output_file_data) and isfile(output_file_seg) and isfile(output_file_pkl):
+                already_processed.append(k)
+            else:
+                keys_to_process.append(k)
+        
+        if len(already_processed) > 0:
+            print(f"發現 {len(already_processed)}/{len(dataset)} 個已處理的文件，將跳過")
+        
+        if len(keys_to_process) == 0:
+            print("所有文件都已處理完成，跳過預處理")
+            return
 
         # identifiers = [os.path.basename(i[:-len(dataset_json['file_ending'])]) for i in seg_fnames]
         # output_filenames_truncated = [join(output_directory, i) for i in identifiers]
@@ -278,17 +307,17 @@ class DefaultPreprocessor(object):
         # multiprocessing magic.
         r = []
         with multiprocessing.get_context("spawn").Pool(num_processes) as p:
-            remaining = list(range(len(dataset)))
+            remaining = list(range(len(keys_to_process)))
             # p is pretty nifti. If we kill workers they just respawn but don't do any work.
             # So we need to store the original pool of workers.
             workers = [j for j in p._pool]
-            for k in dataset.keys():
+            for k in keys_to_process:
                 r.append(p.starmap_async(self.run_case_save,
                                          ((join(output_directory, k), dataset[k]['images'], dataset[k]['label'],
                                            plans_manager, configuration_manager,
                                            dataset_json),)))
 
-            with tqdm(desc=None, total=len(dataset), disable=self.verbose) as pbar:
+            with tqdm(desc=None, total=len(keys_to_process), disable=self.verbose) as pbar:
                 while len(remaining) > 0:
                     all_alive = all([j.is_alive() for j in workers])
                     if not all_alive:

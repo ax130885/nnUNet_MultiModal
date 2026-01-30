@@ -91,7 +91,16 @@ class DatasetFingerprintExtractor(object):
                      num_samples: int = 10000):
         rw = reader_writer_class()
         images, properties_images = rw.read_images(image_files)
-        segmentation, properties_seg = rw.read_seg(segmentation_file)
+        
+        # 【修改】檢查 label 檔案是否存在，如果不存在則生成空 label（negative data）
+        if not isfile(segmentation_file):
+            # Negative data: 無腫瘤，生成全零 segmentation
+            # 使用 int16 而非 uint8，因為 crop_to_nonzero 可能需要賦值 -1
+            segmentation = np.zeros((1, *images.shape[1:]), dtype=np.int16)
+            properties_seg = properties_images.copy()
+            # print(f"✓ Negative data detected (fingerprint_extractor): {segmentation_file} 不存在，生成空 label")
+        else:
+            segmentation, properties_seg = rw.read_seg(segmentation_file)
 
         # we no longer crop and save the cropped images before this is run. Instead we run the cropping on the fly.
         # Downside is that we need to do this twice (once here and once during preprocessing). Upside is that we don't

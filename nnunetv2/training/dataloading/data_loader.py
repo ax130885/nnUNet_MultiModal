@@ -89,7 +89,15 @@ class nnUNetDataLoader(DataLoader):
         return data_shape, seg_shape
 
     def get_bbox(self, data_shape: np.ndarray, force_fg: bool, class_locations: Union[dict, None],
-                 overwrite_class: Union[int, Tuple[int, ...]] = None, verbose: bool = False):
+                 overwrite_class: Union[int, Tuple[int, ...]] = None, verbose: bool = False, 
+                 is_negative_case: bool = False):
+        """
+        獲取裁切的 bounding box
+        
+        Args:
+            is_negative_case: 如果為 True，表示這是 negative data（無腫瘤），
+                            即使 force_fg=True 也會降級為隨機裁切
+        """
         # in dataloader 2d we need to select the slice prior to this and also modify the class_locations to only have
         # locations for the given slice
         need_to_pad = self.need_to_pad.copy()
@@ -105,6 +113,12 @@ class nnUNetDataLoader(DataLoader):
         # define what the upper and lower bound can be to then sample form them with np.random.randint
         lbs = [- need_to_pad[i] // 2 for i in range(dim)]
         ubs = [data_shape[i] + need_to_pad[i] // 2 + need_to_pad[i] % 2 - self.patch_size[i] for i in range(dim)]
+
+        # 【修改】如果是 negative case，即使 force_fg=True 也降級為隨機裁切
+        if is_negative_case and force_fg:
+            if verbose:
+                print('Negative case detected, downgrading force_fg to random cropping')
+            force_fg = False
 
         # if not force_fg then we can just sample the bbox randomly from lb and ub. Else we need to make sure we get
         # at least one of the foreground classes in the patch
@@ -169,6 +183,9 @@ class nnUNetDataLoader(DataLoader):
         # preallocate memory for data and seg
         data_all = np.zeros(self.data_shape, dtype=np.float32)
         seg_all = np.zeros(self.seg_shape, dtype=np.int16)
+        
+        # 追蹤每個樣本是否為 negative case
+        is_negative_cases = []
 
         for j, i in enumerate(selected_keys):
             # oversampling foreground will improve stability of model training, especially if many patches are empty
@@ -176,12 +193,18 @@ class nnUNetDataLoader(DataLoader):
             force_fg = self.get_do_oversample(j)
 
             data, seg, seg_prev, properties = self._data.load_case(i)
+            
+            # 檢查是否為 negative case
+            is_negative_case = properties.get('is_negative_case', False)
+            is_negative_cases.append(is_negative_case)
 
             # If we are doing the cascade then the segmentation from the previous stage will already have been loaded by
             # self._data.load_case(i) (see nnUNetDataset.load_case)
             shape = data.shape[1:]
 
-            bbox_lbs, bbox_ubs = self.get_bbox(shape, force_fg, properties['class_locations'])
+            # 傳遞 is_negative_case 到 get_bbox
+            bbox_lbs, bbox_ubs = self.get_bbox(shape, force_fg, properties['class_locations'], 
+                                               is_negative_case=is_negative_case)
             bbox = [[i, j] for i, j in zip(bbox_lbs, bbox_ubs)]
 
             # use ACVL utils for that. Cleaner.
@@ -213,9 +236,9 @@ class nnUNetDataLoader(DataLoader):
                     else:
                         seg_all = torch.stack(segs)
                     del segs, images
-            return {'data': data_all, 'target': seg_all, 'keys': selected_keys}
+            return {'data': data_all, 'target': seg_all, 'keys': selected_keys, 'is_negative': is_negative_cases}
 
-        return {'data': data_all, 'target': seg_all, 'keys': selected_keys}
+        return {'data': data_all, 'target': seg_all, 'keys': selected_keys, 'is_negative': is_negative_cases}
 
 
 if __name__ == '__main__':

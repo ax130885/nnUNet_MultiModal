@@ -83,12 +83,32 @@ class nnUNetDatasetMultimodal(nnUNetDatasetBlosc2):
         """
         加載單個病例的CT影像、Seg Mask 和臨床資料。
         覆寫父類的 load_case 方法以包含臨床資料。
+        
+        支援 Negative Data（無腫瘤）：
+        - 預處理階段已經為所有 case 生成了 seg 檔案（negative data 是全 0）
+        - 通過 class_locations 是否為空來判斷是否為 negative case
         """
         # 調用父類的 load_case 方法加載影像和標註數據
         # data: 影像的 blosc2 檔案, seg: label的 blosc2 檔案, 
         # seg_prev: cascade模型專用 用不到, properties: 元資訊
         data, seg, seg_prev, properties = super().load_case(identifier)
-        # print(f"正在加載病例: {identifier}")
+        
+        # 判斷是否為 negative case（通過檢查 seg 是否全為 0 或背景）
+        # 或通過 class_locations 是否為空（預處理時已經設置）, class_locations 是一個 dict 例如
+        # # 陽性樣本 (有腫瘤)
+        # class_locations = {
+        #     1: [[120, 150, 80], [121, 150, 80], ...],  # 腫瘤類別的坐標列表
+        #     # 如果有多個前景類別，會有更多 key
+        # }
+
+        # # 陰性樣本 (無腫瘤)
+        # class_locations = {}  # 空字典
+        is_negative_case = not seg.any() or len(properties.get('class_locations', {})) == 0
+        
+        # 在 properties 中添加標記
+        properties['is_negative_case'] = is_negative_case
+        
+        # print(f"正在加載病例: {identifier}, Negative: {is_negative_case}")
         # print(f"影像數據形狀: {data.shape}, 標註數據形狀: {seg.shape}")
 
         # 特殊情況 原生nnunet模組使用的 別動!!

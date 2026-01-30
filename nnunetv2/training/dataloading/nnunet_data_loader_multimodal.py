@@ -28,16 +28,16 @@ class nnUNetDataLoaderMultimodal(nnUNetDataLoader):
                  pad_sides: Union[List[int], Tuple[int, ...]] = None,
                  probabilistic_oversampling: bool = False,
                  transforms=None,
-                #  clinical_drop_probability_global: float = 0.35,
-                #  clinical_drop_probability_column: float = 0.3
+                 clinical_drop_probability_global: float = 0.35,
+                 clinical_drop_probability_column: float = 0.3
                 #  clinical_drop_probability_global: float = 0.4,
                 #  clinical_drop_probability_column: float = 0.4
                 #  clinical_drop_probability_global: float = 0.2,
                 #  clinical_drop_probability_column: float = 0.2
                 #  clinical_drop_probability_global: float = 0.3,
                 #  clinical_drop_probability_column: float = 0.3
-                 clinical_drop_probability_global: float = 0.35,
-                 clinical_drop_probability_column: float = 0.35
+                #  clinical_drop_probability_global: float = 0.35,
+                #  clinical_drop_probability_column: float = 0.35
                  ):
         """
         初始化多模態資料載入器。
@@ -146,6 +146,9 @@ class nnUNetDataLoaderMultimodal(nnUNetDataLoader):
         clinical_data_label = {'location': [], 't_stage': [], 'n_stage': [], 'm_stage': [], 'dataset': []}
         # 初始化臨床資料 mask（是否有 label）
         clinical_mask = {'location': [], 't_stage': [], 'n_stage': [], 'm_stage': [], 'dataset': []}
+        
+        # 追蹤每個樣本是否為 negative case
+        is_negative_cases = []
 
         # j: 第幾次迴圈
         # i: 當前選中的病例識別符 (索引)
@@ -154,10 +157,16 @@ class nnUNetDataLoaderMultimodal(nnUNetDataLoader):
             
             # 從 nnUNetDatasetMultimodal 取得影像、標註、臨床資料和 mask
             data, seg, seg_prev, properties, clinical_data_dict, clinical_mask_bool = self._data.load_case(i)
+            
+            # 檢查是否為 negative case
+            is_negative_case = properties.get('is_negative_case', False)
+            is_negative_cases.append(is_negative_case)
 
             # 影像裁剪與填充邏輯 (與父類相同)
             shape = data.shape[1:]
-            bbox_lbs, bbox_ubs = self.get_bbox(shape, force_fg, properties['class_locations'])
+            # 傳遞 is_negative_case 到 get_bbox
+            bbox_lbs, bbox_ubs = self.get_bbox(shape, force_fg, properties['class_locations'],
+                                               is_negative_case=is_negative_case)
             bbox = [[i, j] for i, j in zip(bbox_lbs, bbox_ubs)]
 
             data_all[j] = crop_and_pad_nd(data, bbox, 0)
@@ -250,7 +259,7 @@ class nnUNetDataLoaderMultimodal(nnUNetDataLoader):
             text_desc = self.generate_text_description(sample_clinical_data, sample_clinical_mask)
             text_descriptions.append(text_desc)
 
-        # 回傳結構
+        # 回傳結構（添加 is_negative 標記）
         return {
             'data': data_all,                    # [B, C, D, H, W] tensor
             'target': seg_all,                   # [B, C, D, H, W] tensor
@@ -258,7 +267,8 @@ class nnUNetDataLoaderMultimodal(nnUNetDataLoader):
             'clinical_data_label': clinical_data_label,  # 原始臨床資料 (計算loss用)
             'clinical_mask': clinical_mask_final,        # 臨床資料 mask
             'keys': selected_keys,                        # [B] list of identifiers
-            'text_descriptions': text_descriptions        # 文字描述列表
+            'text_descriptions': text_descriptions,       # 文字描述列表
+            'is_negative': is_negative_cases              # [B] list of bool - 是否為 negative case
         }
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 import warnings
 from typing import List, Type, Optional, Tuple, Union
 
-from batchgenerators.utilities.file_and_folder_operations import join, maybe_mkdir_p, load_json
+from batchgenerators.utilities.file_and_folder_operations import join, maybe_mkdir_p, load_json, isfile
 
 import nnunetv2
 from nnunetv2.configuration import default_num_processes
@@ -135,10 +135,17 @@ def preprocess_dataset(dataset_id: int,
     dataset_json = load_json(join(nnUNet_raw, dataset_name, 'dataset.json'))
     dataset = get_filenames_of_train_images_and_targets(join(nnUNet_raw, dataset_name), dataset_json)
     # only copy files that are newer than the ones already present
+    # 【修改】支援 negative data：如果 label 檔案不存在（陰性樣本），跳過複製
     for k in dataset:
-        copy_file(dataset[k]['label'],
-                  join(nnUNet_preprocessed, dataset_name, 'gt_segmentations', k + dataset_json['file_ending']),
-                  update=True)
+        label_file = dataset[k]['label']
+        if isfile(label_file):
+            copy_file(label_file,
+                      join(nnUNet_preprocessed, dataset_name, 'gt_segmentations', k + dataset_json['file_ending']),
+                      update=True)
+        else:
+            # Negative data（無腫瘤），不需要複製 label
+            if verbose:
+                print(f"跳過 {k}：label 檔案不存在（negative data）")
 
 
 def preprocess(dataset_ids: List[int],
