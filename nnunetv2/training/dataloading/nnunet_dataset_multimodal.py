@@ -94,16 +94,11 @@ class nnUNetDatasetMultimodal(nnUNetDatasetBlosc2):
         data, seg, seg_prev, properties = super().load_case(identifier)
         
         # 判斷是否為 negative case（通過檢查 seg 是否全為 0 或背景）
-        # 或通過 class_locations 是否為空（預處理時已經設置）, class_locations 是一個 dict 例如
-        # # 陽性樣本 (有腫瘤)
-        # class_locations = {
-        #     1: [[120, 150, 80], [121, 150, 80], ...],  # 腫瘤類別的坐標列表
-        #     # 如果有多個前景類別，會有更多 key
-        # }
-
-        # # 陰性樣本 (無腫瘤)
-        # class_locations = {}  # 空字典
-        is_negative_case = not seg.any() or len(properties.get('class_locations', {})) == 0
+        # 或通過 class_locations 是否為空（預處理時已經設置）
+        # 注意：class_locations 可能是 {1: []} 而不是 {}，需要檢查是否有非空的 list
+        class_locations = properties.get('class_locations', {})
+        has_foreground = any(len(v) > 0 for v in class_locations.values()) if class_locations else False
+        is_negative_case = not seg.any() or not has_foreground
         
         # 在 properties 中添加標記
         properties['is_negative_case'] = is_negative_case

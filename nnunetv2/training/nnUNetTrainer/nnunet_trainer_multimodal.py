@@ -245,11 +245,11 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
         if self.label_manager.has_regions:
             seg_loss = DC_and_BCE_loss({},
                                      {'batch_dice': self.configuration_manager.batch_dice,
-                                      'do_bg': True, 'smooth': 1e-5, 'ddp': self.is_ddp},
+                                      'do_bg': True, 'smooth': 0.0011, 'ddp': self.is_ddp},
                                      use_ignore_label=self.label_manager.ignore_label is not None)
         else:
             seg_loss = DC_and_CE_loss({'batch_dice': self.configuration_manager.batch_dice,
-                                      'smooth': 1e-5, 'do_bg': False, 'ddp': self.is_ddp}, {}, weight_ce=1, weight_dice=1,
+                                      'smooth': 0.0011, 'do_bg': False, 'ddp': self.is_ddp}, {}, weight_ce=1, weight_dice=1,
                                       ignore_label=self.label_manager.ignore_label)
         
         # 如果啟用深度監督，則包裝分割損失
@@ -637,6 +637,30 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
             seg_target = [i.to(self.device, non_blocking=True) for i in seg_target]
         else: # 如果只有一種分割目標
             seg_target = seg_target.to(self.device, non_blocking=True)
+        
+        # 【新增】判斷每個 patch 是否包含前景（而非判斷 case 是否陽性）
+        # 檢查 seg_target 是否有前景類別 (非 0 且非 -1 ignore label)
+        if isinstance(seg_target, (list, tuple)):
+            seg_for_check = seg_target[0]  # Deep supervision 時取第一個
+        else:
+            seg_for_check = seg_target
+        
+        # 判斷每個 patch 是否包含前景
+        has_foreground = []
+        for i in range(seg_for_check.shape[0]):
+            patch_seg = seg_for_check[i]
+            # 檢查是否有前景 (值 > 0，排除 -1 ignore label)
+            fg_mask = patch_seg > 0
+            has_fg = fg_mask.any().item()
+            has_foreground.append(has_fg)
+        
+        # 統計前景和背景 patch
+        num_foreground = sum(has_foreground)
+        num_background = len(has_foreground) - num_foreground
+        
+        # 記錄索引
+        foreground_indices = [i for i, has_fg in enumerate(has_foreground) if has_fg]
+        background_indices = [i for i, has_fg in enumerate(has_foreground) if not has_fg]
 
         # 將臨床特徵(模型輸入)移動到指定設備
         loc_input = torch.tensor(clinical_data_aug['location']).to(self.device, non_blocking=True)
@@ -774,39 +798,40 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
                 # 更新最後計算梯度範數的 epoch
                 self.last_grad_norm_update_epoch = self.current_epoch
 
-                # 輸出梯度範數和調整因子 (方便調試)
-                if self.local_rank == 0:
-                    self.print_to_log_file(f"Epoch {self.current_epoch} - Grad Norms: seg={seg_grad_norm:.4f}, "
-                                          f"loc={loc_grad_norm:.4f}, t={t_grad_norm:.4f}, "
-                                          f"n={n_grad_norm:.4f}, m={m_grad_norm:.4f}, dataset={dataset_grad_norm:.4f}")
-                    self.print_to_log_file(f"Epoch {self.current_epoch} - EMA Norms: seg={self.ema_grad_norm['seg']:.4f}, "
-                                          f"loc={self.ema_grad_norm['location']:.4f}, "
-                                          f"t={self.ema_grad_norm['t_stage']:.4f}, "
-                                          f"n={self.ema_grad_norm['n_stage']:.4f}, "
-                                          f"m={self.ema_grad_norm['m_stage']:.4f}, "
-                                          f"dataset={self.ema_grad_norm['dataset']:.4f}")
-                    self.print_to_log_file(f"Epoch {self.current_epoch} - GradNorm Factors: "
-                                        f"seg={self.grad_norm_factors['seg']:.4f}, "
-                                        f"loc={self.grad_norm_factors['location']:.4f}, "
-                                        f"t={self.grad_norm_factors['t_stage']:.4f}, "
-                                        f"n={self.grad_norm_factors['n_stage']:.4f}, "
-                                        f"m={self.grad_norm_factors['m_stage']:.4f}, "
-                                        f"dataset={self.grad_norm_factors['dataset']:.4f}")
-                    self.print_to_log_file(f"Epoch {self.current_epoch} - Base Weights: "
-                                        f"seg={self.clinical_loss_manual_weights.get('seg', 1.0):.4f}, "
-                                        f"loc={self.clinical_loss_manual_weights['location']:.4f}, "
-                                        f"t={self.clinical_loss_manual_weights['t_stage']:.4f}, "
-                                        f"n={self.clinical_loss_manual_weights['n_stage']:.4f}, "
-                                        f"m={self.clinical_loss_manual_weights['m_stage']:.4f}, "
-                                        f"dataset={self.clinical_loss_manual_weights['dataset']:.4f}")
-                    self.print_to_log_file(f"Epoch {self.current_epoch} - Final Weights: "
-                                        f"seg={self.clinical_loss_manual_weights.get('seg', 1.0) * self.grad_norm_factors['seg']:.4f}, "
-                                        f"loc={self.clinical_loss_manual_weights['location'] * self.grad_norm_factors['location']:.4f}, "
-                                        f"t={self.clinical_loss_manual_weights['t_stage'] * self.grad_norm_factors['t_stage']:.4f}, "
-                                        f"n={self.clinical_loss_manual_weights['n_stage'] * self.grad_norm_factors['n_stage']:.4f}, "
-                                        f"m={self.clinical_loss_manual_weights['m_stage'] * self.grad_norm_factors['m_stage']:.4f}, "
-                                        f"dataset={self.clinical_loss_manual_weights['dataset'] * self.grad_norm_factors['dataset']:.4f}")
-                    self.print_to_log_file("") # 空行
+                # # GradNorm 調試輸出
+                # # 輸出梯度範數和調整因子 (方便調試)
+                # if self.local_rank == 0:
+                #     self.print_to_log_file(f"Epoch {self.current_epoch} - Grad Norms: seg={seg_grad_norm:.4f}, "
+                #                           f"loc={loc_grad_norm:.4f}, t={t_grad_norm:.4f}, "
+                #                           f"n={n_grad_norm:.4f}, m={m_grad_norm:.4f}, dataset={dataset_grad_norm:.4f}")
+                #     self.print_to_log_file(f"Epoch {self.current_epoch} - EMA Norms: seg={self.ema_grad_norm['seg']:.4f}, "
+                #                           f"loc={self.ema_grad_norm['location']:.4f}, "
+                #                           f"t={self.ema_grad_norm['t_stage']:.4f}, "
+                #                           f"n={self.ema_grad_norm['n_stage']:.4f}, "
+                #                           f"m={self.ema_grad_norm['m_stage']:.4f}, "
+                #                           f"dataset={self.ema_grad_norm['dataset']:.4f}")
+                #     self.print_to_log_file(f"Epoch {self.current_epoch} - GradNorm Factors: "
+                #                         f"seg={self.grad_norm_factors['seg']:.4f}, "
+                #                         f"loc={self.grad_norm_factors['location']:.4f}, "
+                #                         f"t={self.grad_norm_factors['t_stage']:.4f}, "
+                #                         f"n={self.grad_norm_factors['n_stage']:.4f}, "
+                #                         f"m={self.grad_norm_factors['m_stage']:.4f}, "
+                #                         f"dataset={self.grad_norm_factors['dataset']:.4f}")
+                #     self.print_to_log_file(f"Epoch {self.current_epoch} - Base Weights: "
+                #                         f"seg={self.clinical_loss_manual_weights.get('seg', 1.0):.4f}, "
+                #                         f"loc={self.clinical_loss_manual_weights['location']:.4f}, "
+                #                         f"t={self.clinical_loss_manual_weights['t_stage']:.4f}, "
+                #                         f"n={self.clinical_loss_manual_weights['n_stage']:.4f}, "
+                #                         f"m={self.clinical_loss_manual_weights['m_stage']:.4f}, "
+                #                         f"dataset={self.clinical_loss_manual_weights['dataset']:.4f}")
+                #     self.print_to_log_file(f"Epoch {self.current_epoch} - Final Weights: "
+                #                         f"seg={self.clinical_loss_manual_weights.get('seg', 1.0) * self.grad_norm_factors['seg']:.4f}, "
+                #                         f"loc={self.clinical_loss_manual_weights['location'] * self.grad_norm_factors['location']:.4f}, "
+                #                         f"t={self.clinical_loss_manual_weights['t_stage'] * self.grad_norm_factors['t_stage']:.4f}, "
+                #                         f"n={self.clinical_loss_manual_weights['n_stage'] * self.grad_norm_factors['n_stage']:.4f}, "
+                #                         f"m={self.clinical_loss_manual_weights['m_stage'] * self.grad_norm_factors['m_stage']:.4f}, "
+                #                         f"dataset={self.clinical_loss_manual_weights['dataset'] * self.grad_norm_factors['dataset']:.4f}")
+                #     self.print_to_log_file("") # 空行
             
 
             # 計算各類最終損失
@@ -843,6 +868,10 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
             torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
             self.optimizer.step()
 
+        # # 【調適損失】每個 iteration 輸出 foreground/background 統計
+        # print(f"  [Iter] Foreground: {num_foreground:3d} patches | "
+        #       f"Background: {num_background:3d} patches | "
+        #       f"Seg Loss: {seg_loss_tr.item():.4f}\n")
 
         # 返回所有損失值 (轉移到 CPU 並轉換為 numpy)
         return {
@@ -1739,10 +1768,11 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
                     self.clinical_loss_manual_weights[task] = current_weight
                     break
 
-        # 可選：打印當前權重（僅在 rank 0 進程，避免重複打印）
-        if self.local_rank == 0:
-            # 打印當前權重
-            self.print_to_log_file(f"Epoch {current_epoch}: 更新臨床損失權重為 {self.clinical_loss_manual_weights}")
+        # # GradNorm 調適
+        # # 可選：打印當前權重（僅在 rank 0 進程，避免重複打印）
+        # if self.local_rank == 0:
+        #     # 打印當前權重
+        #     self.print_to_log_file(f"Epoch {current_epoch}: 更新臨床損失權重為 {self.clinical_loss_manual_weights}")
 
 
     def set_deep_supervision_enabled(self, enabled: bool):

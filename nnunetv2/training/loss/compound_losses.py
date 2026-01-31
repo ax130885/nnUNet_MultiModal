@@ -1,5 +1,5 @@
 import torch
-from nnunetv2.training.loss.dice import SoftDiceLoss, MemoryEfficientSoftDiceLoss
+from nnunetv2.training.loss.dice import SoftDiceLoss, MemoryEfficientSoftDiceLoss, NormalizedSoftDiceLoss  # 【新增】導入正規化版本
 from nnunetv2.training.loss.robust_ce_loss import RobustCrossEntropyLoss, TopKLoss
 from nnunetv2.utilities.helpers import softmax_helper_dim1
 from torch import nn
@@ -7,7 +7,9 @@ from torch import nn
 
 class DC_and_CE_loss(nn.Module):
     def __init__(self, soft_dice_kwargs, ce_kwargs, weight_ce=1, weight_dice=1, ignore_label=None,
-                 dice_class=SoftDiceLoss):
+                 dice_class=NormalizedSoftDiceLoss):  # 【新增】預設使用正規化版本
+                 # dice_class=SoftDiceLoss):  # 【原本】使用標準版本
+        print("使用 DC_and_CE_loss 損失函數")
         """
         Weights for CE and Dice do not need to sum to one. You can set whatever you want.
         :param soft_dice_kwargs:
@@ -53,12 +55,14 @@ class DC_and_CE_loss(nn.Module):
             if self.weight_ce != 0 and (self.ignore_label is None or num_fg > 0) else 0
 
         result = self.weight_ce * ce_loss + self.weight_dice * dc_loss
+        # result = self.weight_dice * dc_loss
         return result
 
 
 class DC_and_BCE_loss(nn.Module):
     def __init__(self, bce_kwargs, soft_dice_kwargs, weight_ce=1, weight_dice=1, use_ignore_label: bool = False,
                  dice_class=MemoryEfficientSoftDiceLoss):
+        print("使用 DC_and_BCE_loss 損失函數")
         """
         請勿在網路中自行套用非線性激活函數！
 
