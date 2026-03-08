@@ -7,8 +7,7 @@ from torch import nn
 
 class DC_and_CE_loss(nn.Module):
     def __init__(self, soft_dice_kwargs, ce_kwargs, weight_ce=1, weight_dice=1, ignore_label=None,
-                 dice_class=NormalizedSoftDiceLoss):  # 【新增】預設使用正規化版本
-                 # dice_class=SoftDiceLoss):  # 【原本】使用標準版本
+                 dice_class=SoftDiceLoss):  # SoftDiceLoss NormalizedSoftDiceLoss
         print("使用 DC_and_CE_loss 損失函數")
         """
         Weights for CE and Dice do not need to sum to one. You can set whatever you want.

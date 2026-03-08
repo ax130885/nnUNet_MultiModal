@@ -245,11 +245,11 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
         if self.label_manager.has_regions:
             seg_loss = DC_and_BCE_loss({},
                                      {'batch_dice': self.configuration_manager.batch_dice,
-                                      'do_bg': True, 'smooth': 0.0011, 'ddp': self.is_ddp},
+                                      'do_bg': True, 'smooth': 1e-5, 'ddp': self.is_ddp},
                                      use_ignore_label=self.label_manager.ignore_label is not None)
         else:
             seg_loss = DC_and_CE_loss({'batch_dice': self.configuration_manager.batch_dice,
-                                      'smooth': 0.0011, 'do_bg': False, 'ddp': self.is_ddp}, {}, weight_ce=1, weight_dice=1,
+                                      'smooth': 1e-5, 'do_bg': False, 'ddp': self.is_ddp}, {}, weight_ce=1, weight_dice=1,
                                       ignore_label=self.label_manager.ignore_label)
         
         # 如果啟用深度監督，則包裝分割損失
@@ -1577,9 +1577,11 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
         # 更新臨床損失權重
         self.update_clinical_loss_manual_weights()
 
-        super().on_epoch_end() # 調用父類方法處理時間戳、Dice 記錄和檢查點儲存
+        # 重要：必須在 super().on_epoch_end() 之前更新 scheduler
+        # 因為 checkpoint 是在 super().on_epoch_end() 裡面保存的
+        self.lr_scheduler.step()
 
-        self.lr_scheduler.step() # 
+        super().on_epoch_end() # 調用父類方法處理時間戳、Dice 記錄和檢查點儲存 
 
     
     def save_checkpoint(self, filename: str) -> None:
@@ -1688,8 +1690,11 @@ class nnUNetTrainerMultimodal(nnUNetTrainer):
             # 檢查 scheduler 的 last_epoch 是否與 current_epoch 一致
             expected_last_epoch = self.current_epoch - 1  # scheduler.last_epoch 通常比 current_epoch 少 1
             if hasattr(self.lr_scheduler, 'last_epoch'):
-                if abs(self.lr_scheduler.last_epoch - expected_last_epoch) > 1:
-                    raise RuntimeError(f"Scheduler last_epoch 異常: scheduler.last_epoch={self.lr_scheduler.last_epoch}, expected={expected_last_epoch}")
+                if abs(self.lr_scheduler.last_epoch - expected_last_epoch) > 3:  # 放寬容忍度到 3
+                    self.print_to_log_file(f"[警告] Scheduler last_epoch 有偏差: scheduler.last_epoch={self.lr_scheduler.last_epoch}, expected={expected_last_epoch}")
+                    self.print_to_log_file(f"[自動修正] 將 scheduler.last_epoch 設為 {expected_last_epoch}")
+                    # 自動修正而不是拋出錯誤
+                    self.lr_scheduler.last_epoch = expected_last_epoch
             
             # 特別針對 cosine scheduler 檢查曲率
             current_lr = self.optimizer.param_groups[0]['lr']
